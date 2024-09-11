@@ -4,3 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+secp256k1 = { version = "0.28.0", features = ["serde"] }
+sha2 = "0.10.8"
+hmac = "0.12.1"
+thiserror = "1.0"
+chacha20 = "0.9.1"
+
+[dev-dependencies]
+hex-conservative = "0.2.1"
