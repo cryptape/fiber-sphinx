@@ -1,29 +1,31 @@
-use std::str::FromStr;
-
+use chacha20::{
+    cipher::{KeyIvInit as _, StreamCipher as _},
+    ChaCha20,
+};
 use hmac::{Hmac, Mac as _};
 use secp256k1::{ecdh::SharedSecret, PublicKey, Scalar, Secp256k1, SecretKey, Signing};
 use sha2::{Digest as _, Sha256};
+use std::str::FromStr;
 use thiserror::Error;
 
-pub const HOP_DATA_LEN: usize = 1300;
+pub const ONION_PAYLOAD_LEN: usize = 1300;
 
 const HMAC_KEY_RHO: &[u8] = b"rho";
 const HMAC_KEY_MU: &[u8] = b"mu";
 
-// TODO: use molecule to serialize?
 pub struct OnionPacket {
     pub version: u8,
     pub public_key: PublicKey,
-    pub hop_data: [u8; HOP_DATA_LEN],
+    pub payload: [u8; ONION_PAYLOAD_LEN],
     pub hmac: [u8; 32],
 }
 
 impl OnionPacket {
     pub fn into_bytes(self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(1 + 33 + HOP_DATA_LEN + 32);
+        let mut bytes = Vec::with_capacity(1 + 33 + ONION_PAYLOAD_LEN + 32);
         bytes.push(self.version);
         bytes.extend_from_slice(&self.public_key.serialize());
-        bytes.extend_from_slice(&self.hop_data);
+        bytes.extend_from_slice(&self.payload);
         bytes.extend_from_slice(&self.hmac);
         bytes
     }
@@ -31,8 +33,8 @@ impl OnionPacket {
 
 #[derive(Error, Debug)]
 pub enum SphinxError {
-    #[error("unknown sphinx error")]
-    Unknown,
+    #[error("The generated packet size is too large")]
+    PacketSizeTooLarge,
 }
 
 /// Derives the ephemeral secret key for the next hop.
@@ -71,7 +73,7 @@ pub struct HopKeys {
     pub mu: [u8; 32],
 }
 
-pub fn derive_hop_keys<C: Signing>(
+pub fn derive_hops_keys<C: Signing>(
     payment_path: &Vec<PublicKey>,
     session_key: SecretKey,
     secp_ctx: &Secp256k1<C>,
@@ -109,15 +111,42 @@ pub fn derive_key(hmac_key: &[u8], shared_secret: &[u8]) -> [u8; 32] {
 /// Generates the initial 1300 bytes of onion packet padding data from PRG.
 ///
 /// Uses Chacha as the PRG. The key is derived from the session key using HMAC, and the nonce is all zeros.
-pub fn generate_padding_data(pad_key: &[u8]) -> [u8; HOP_DATA_LEN] {
-    use chacha20::{
-        cipher::{KeyIvInit, StreamCipher},
-        ChaCha20,
-    };
+pub fn generate_padding_data(pad_key: &[u8]) -> [u8; ONION_PAYLOAD_LEN] {
     let mut cipher = ChaCha20::new(pad_key.into(), &[0u8; 12].into());
-    let mut buffer = [0u8; HOP_DATA_LEN];
+    let mut buffer = [0u8; ONION_PAYLOAD_LEN];
     cipher.apply_keystream(&mut buffer);
     buffer
+}
+
+pub fn generate_filler(
+    hops_keys: &[HopKeys],
+    hops_data: &[Vec<u8>],
+) -> Result<Vec<u8>, SphinxError> {
+    let mut filler = Vec::new();
+    let mut pos = 0;
+
+    for (i, (data, keys)) in hops_data.iter().zip(hops_keys.iter()).enumerate() {
+        let mut chacha = ChaCha20::new(&keys.rho.into(), &[0u8; 12].into());
+        for _ in 0..(ONION_PAYLOAD_LEN - pos) {
+            let mut dummy = [0; 1];
+            chacha.apply_keystream(&mut dummy);
+        }
+
+        // 32 for mac
+        pos += data.len() + 32;
+        if pos > ONION_PAYLOAD_LEN {
+            return Err(SphinxError::PacketSizeTooLarge);
+        }
+
+        if i == hops_data.len() - 1 {
+            break;
+        }
+
+        filler.resize(pos, 0u8);
+        chacha.apply_keystream(&mut filler);
+    }
+
+    Ok(filler)
 }
 
 pub fn new_onion_packet(
@@ -132,7 +161,7 @@ pub fn new_onion_packet(
             "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619",
         )
         .unwrap(),
-        hop_data: [0u8; HOP_DATA_LEN],
+        payload: [0u8; ONION_PAYLOAD_LEN],
         hmac: [0u8; 32],
     })
 }
@@ -159,6 +188,16 @@ mod tests {
         .collect()
     }
 
+    fn get_test_hops_data() -> Vec<Vec<u8>> {
+        vec![
+            Vec::from_hex("1202023a98040205dc06080000000000000001").unwrap(),
+            Vec::from_hex("52020236b00402057806080000000000000002fd02013c0102030405060708090a0b0c0d0e0f0102030405060708090a0b0c0d0e0f0102030405060708090a0b0c0d0e0f0102030405060708090a0b0c0d0e0f").unwrap(),
+            Vec::from_hex("12020230d4040204e206080000000000000003").unwrap(),
+            Vec::from_hex("1202022710040203e806080000000000000004").unwrap(),
+            Vec::from_hex("fd011002022710040203e8082224a33562c54507a9334e79f0dc4f17d407e6d7c61f0e2f3d0d38599502f617042710fd012de02a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a").unwrap(),
+        ]
+    }
+
     #[test]
     fn it_works() {
         let payment_path = get_test_payment_path();
@@ -178,95 +217,95 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_hop_keys() {
+    fn test_derive_hops_keys() {
         let payment_path = get_test_payment_path();
         let session_key = get_test_session_key();
-        let hop_keys = derive_hop_keys(&payment_path, session_key, &Secp256k1::new());
+        let hops_keys = derive_hops_keys(&payment_path, session_key, &Secp256k1::new());
 
-        assert_eq!(hop_keys.len(), 5);
+        assert_eq!(hops_keys.len(), 5);
 
         // hop 0
         assert_eq!(
-            hop_keys[0]
+            hops_keys[0]
                 .ephemeral_public_key
                 .serialize()
                 .to_lower_hex_string(),
             "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619",
         );
         assert_eq!(
-            hop_keys[0].rho.to_lower_hex_string(),
+            hops_keys[0].rho.to_lower_hex_string(),
             "ce496ec94def95aadd4bec15cdb41a740c9f2b62347c4917325fcc6fb0453986",
         );
         assert_eq!(
-            hop_keys[0].mu.to_lower_hex_string(),
+            hops_keys[0].mu.to_lower_hex_string(),
             "b57061dc6d0a2b9f261ac410c8b26d64ac5506cbba30267a649c28c179400eba",
         );
 
         // hop 1
         assert_eq!(
-            hop_keys[1]
+            hops_keys[1]
                 .ephemeral_public_key
                 .serialize()
                 .to_lower_hex_string(),
             "028f9438bfbf7feac2e108d677e3a82da596be706cc1cf342b75c7b7e22bf4e6e2",
         );
         assert_eq!(
-            hop_keys[1].rho.to_lower_hex_string(),
+            hops_keys[1].rho.to_lower_hex_string(),
             "450ffcabc6449094918ebe13d4f03e433d20a3d28a768203337bc40b6e4b2c59",
         );
         assert_eq!(
-            hop_keys[1].mu.to_lower_hex_string(),
+            hops_keys[1].mu.to_lower_hex_string(),
             "05ed2b4a3fb023c2ff5dd6ed4b9b6ea7383f5cfe9d59c11d121ec2c81ca2eea9",
         );
 
         // hop 2
         assert_eq!(
-            hop_keys[2]
+            hops_keys[2]
                 .ephemeral_public_key
                 .serialize()
                 .to_lower_hex_string(),
             "03bfd8225241ea71cd0843db7709f4c222f62ff2d4516fd38b39914ab6b83e0da0",
         );
         assert_eq!(
-            hop_keys[2].rho.to_lower_hex_string(),
+            hops_keys[2].rho.to_lower_hex_string(),
             "11bf5c4f960239cb37833936aa3d02cea82c0f39fd35f566109c41f9eac8deea",
         );
         assert_eq!(
-            hop_keys[2].mu.to_lower_hex_string(),
+            hops_keys[2].mu.to_lower_hex_string(),
             "caafe2820fa00eb2eeb78695ae452eba38f5a53ed6d53518c5c6edf76f3f5b78",
         );
 
         // hop 3
         assert_eq!(
-            hop_keys[3]
+            hops_keys[3]
                 .ephemeral_public_key
                 .serialize()
                 .to_lower_hex_string(),
             "031dde6926381289671300239ea8e57ffaf9bebd05b9a5b95beaf07af05cd43595",
         );
         assert_eq!(
-            hop_keys[3].rho.to_lower_hex_string(),
+            hops_keys[3].rho.to_lower_hex_string(),
             "cbe784ab745c13ff5cffc2fbe3e84424aa0fd669b8ead4ee562901a4a4e89e9e",
         );
         assert_eq!(
-            hop_keys[3].mu.to_lower_hex_string(),
+            hops_keys[3].mu.to_lower_hex_string(),
             "5052aa1b3d9f0655a0932e50d42f0c9ba0705142c25d225515c45f47c0036ee9",
         );
 
         // hop 4
         assert_eq!(
-            hop_keys[4]
+            hops_keys[4]
                 .ephemeral_public_key
                 .serialize()
                 .to_lower_hex_string(),
             "03a214ebd875aab6ddfd77f22c5e7311d7f77f17a169e599f157bbcdae8bf071f4",
         );
         assert_eq!(
-            hop_keys[4].rho.to_lower_hex_string(),
+            hops_keys[4].rho.to_lower_hex_string(),
             "034e18b8cc718e8af6339106e706c52d8df89e2b1f7e9142d996acf88df8799b",
         );
         assert_eq!(
-            hop_keys[4].mu.to_lower_hex_string(),
+            hops_keys[4].mu.to_lower_hex_string(),
             "8e45e5c61c2b24cb6382444db6698727afb063adecd72aada233d4bf273d975a",
         );
     }
@@ -290,5 +329,18 @@ mod tests {
         let padding = generate_padding_data(&pad_key);
         let expected_hex = "77b5a170c57c6ff643fd6f46f5537c2fec4c5258f89fafbd722f9041f1cead9b2ab563384bc052ab9179e7d97defbee5324b29d5655f6816916310c4f08b69ad20a51ad7ffa2e07f5b28c30a2b3175adbf8d249c1fa55b02daa7c463eaf4b843ff9567afec9ef70cfc1d84ef29a802d1755c3cc6d04536744a71aa94a2419a6b5501ee8a8209191c1f43b357442a5c0847140db9c907bb2a325c414bfd1e72b1867526b071f96d718c176ff52894b45d1480149ad5d36614fb68b043d23aeb2806344832e8f925ed5428866912f4f1e7203ec73ec37fbb581e36b25fadc42bb4a5acf50d7ef1139a8482c7588bbfdfe5bde63ccb13b54d4368a4891e9c6c876814f189e9681a4efb59a91564e9f72e2047ce30840c06653ecc998ba216585cbeca617434a91a05bd8ae20b41ed84de5cfb0c3eb57ec721d4be57cf5f3223f99cfcb4250daee92b00b0de4c2d8e9e6cc6dafca49c136ef3b8ba7d983d52b079ef249f3c487ed6e982410bf86ab22636d22e06f3db5bbb887503167383f631e318ab71270528202994741264a40c69abe78eb0320ad420b229eca2335b928a3497cba182a427b0826260976608d5f50d35a5edc3574b532e28f114d21f93055f681f658fe9f6af8bac4ab5b1ec86dd575767501b6555963faba6766d70513c2cb8fbe6285f3ffea20b3b70b2e6960aca1633aa5368e19bec042ef32eacb5d326de1bc0e3120d9fe6da7f5407c7e77a66dac8f91ae11d727a5720a42ed152e6a95f61a61d80374fb0d6021d8f0a34e812bdba530bb4907b3192576a8021fae60615f89a420ada2f616fb9d006cc23621f72573e510417e91efe2335c246d614d105661866e878a1cae8dc29b92141b8d3e57479e73efa159e4a030531b54f0f9315a88e307bc0d152840166b88ed1afe6fbf159c3b74d04b7e9a31b93123fc5de7918eb1a8bd0a07ab4f07315ac5abbc36df06f613099d7f42d075366f42dd7ace9d975636363a5da4ea575a05c7114352a4b579b7aa129691e0b17934dd1146e34fa6246c953080503b9dfee62380669ebcb049e58bb259c6b1b64ff13891d0beb26dea5e624e5115ac1266e4facc65d5a0878066a253d1e9b3a2e465709ede22b312da118ad0446f2e725177452fd8f8b2eb743dbdbe3298e628c6910eb722415167eae745a28d15e2a0221db7ac7b684523b0af415acbcb9bed1d5a6fe74bb0e4e20543d684da1fad2199830e7ac421168acbc6ed547fd1ab4acd32adc34329af0a2ebfa80edeefb6fff2d6a4828b7b67da22f59ca68edcae4832be0ea856b075efbb4e14fad5e0ea5269cd75bac001acbc512833b44bbead8c861c8b2755ced0d594b7fd6b61f7f80341fe02549600298e1f68685f582d8bf5f51c01e2a68324456fd4cc342200252fd9a0025ce6b921bee965a350638830920a90f715959a936bc7cb6fef1fde4524c7eae46677efcd87be375ce25afa0d7c82bf445578ff6c49a3e461fcbe18faf4c6d711fd62a2a14e683f5919e7672deec93ccc0a843e90f7d88365bf469151793dbd9b15ef16a44909238f23cf84bcf11736089ab5ed0a0063c023cc0f90374dc37430e4279c05adb333e98cea0e650345d989b53653a1a3820410b7a1ad25bcfb39618c2b6ac29b2baa5325cc92647c9d13428d8be77b8c5f9c0492fc85a6d770ee6f123edc25b3009304c8691d90c2c54abf07413ac2ddd4d1abe34841739d4d88e865f7dda32bfe7a914400c7aa41a05745d9a4158641b26c510d671e4a539ac8d5f7a3ddb227d02788ba7b33222f2d1af605378636cddfa81825ebea6b68b0d8fca71277cdda7af17";
         assert_eq!(padding.to_lower_hex_string(), expected_hex);
+    }
+
+    #[test]
+    fn test_generate_filler() {
+        let payment_path = get_test_payment_path();
+        let session_key = get_test_session_key();
+        let hops_keys = derive_hops_keys(&payment_path, session_key, &Secp256k1::new());
+        let hops_data = get_test_hops_data();
+
+        let filler = generate_filler(&hops_keys, &hops_data);
+        assert!(filler.is_ok());
+        let expected_hex = "51c30cc8f20da0153ca3839b850bcbc8fefc7fd84802f3e78cb35a660e747b57aa5b0de555cbcf1e6f044a718cc34219b96597f3684eee7a0232e1754f638006cb15a14788217abdf1bdd67910dc1ca74a05dcce8b5ad841b0f939fca8935f6a3ff660e0efb409f1a24ce4aa16fc7dc074cd84422c10cc4dd4fc150dd6d1e4f50b36ce10fef29248dd0cec85c72eb3e4b2f4a7c03b5c9e0c9dd12976553ede3d0e295f842187b33ff743e6d685075e98e1bcab8a46bff0102ca8b2098ae91798d370b01ca7076d3d626952a03663fe8dc700d1358263b73ba30e36731a0b72092f8d5bc8cd346762e93b2bf203d00264e4bc136fc142de8f7b69154deb05854ea88e2d7506222c95ba1aab06";
+        assert_eq!(filler.unwrap().to_lower_hex_string(), expected_hex);
     }
 }
