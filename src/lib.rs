@@ -5,27 +5,28 @@ use chacha20::{
 use hmac::{Hmac, Mac as _};
 use secp256k1::{ecdh::SharedSecret, PublicKey, Scalar, Secp256k1, SecretKey, Signing};
 use sha2::{Digest as _, Sha256};
-use std::str::FromStr;
 use thiserror::Error;
 
-pub const ONION_PAYLOAD_LEN: usize = 1300;
+pub const ONION_PACKET_DATA_LEN: usize = 1300;
 
 const HMAC_KEY_RHO: &[u8] = b"rho";
 const HMAC_KEY_MU: &[u8] = b"mu";
+const HMAC_KEY_PAD: &[u8] = b"pad";
 
+#[derive(Debug, Clone)]
 pub struct OnionPacket {
     pub version: u8,
     pub public_key: PublicKey,
-    pub payload: [u8; ONION_PAYLOAD_LEN],
+    pub packet_data: [u8; ONION_PACKET_DATA_LEN],
     pub hmac: [u8; 32],
 }
 
 impl OnionPacket {
     pub fn into_bytes(self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(1 + 33 + ONION_PAYLOAD_LEN + 32);
+        let mut bytes = Vec::with_capacity(1 + 33 + ONION_PACKET_DATA_LEN + 32);
         bytes.push(self.version);
         bytes.extend_from_slice(&self.public_key.serialize());
-        bytes.extend_from_slice(&self.payload);
+        bytes.extend_from_slice(&self.packet_data);
         bytes.extend_from_slice(&self.hmac);
         bytes
     }
@@ -33,8 +34,17 @@ impl OnionPacket {
 
 #[derive(Error, Debug)]
 pub enum SphinxError {
-    #[error("The generated packet size is too large")]
-    PacketSizeTooLarge,
+    #[error("The generated packet length is too large")]
+    PacketLenTooLarge,
+
+    #[error("The filler length is too large")]
+    FillerLenTooLarge,
+
+    #[error("The payment path does not match the hops data length")]
+    HopsLenMismatch,
+
+    #[error("The hops path is empty")]
+    HopsIsEmpty,
 }
 
 /// Derives the ephemeral secret key for the next hop.
@@ -111,9 +121,9 @@ pub fn derive_key(hmac_key: &[u8], shared_secret: &[u8]) -> [u8; 32] {
 /// Generates the initial 1300 bytes of onion packet padding data from PRG.
 ///
 /// Uses Chacha as the PRG. The key is derived from the session key using HMAC, and the nonce is all zeros.
-pub fn generate_padding_data(pad_key: &[u8]) -> [u8; ONION_PAYLOAD_LEN] {
+pub fn generate_padding_data(pad_key: &[u8]) -> [u8; ONION_PACKET_DATA_LEN] {
     let mut cipher = ChaCha20::new(pad_key.into(), &[0u8; 12].into());
-    let mut buffer = [0u8; ONION_PAYLOAD_LEN];
+    let mut buffer = [0u8; ONION_PACKET_DATA_LEN];
     cipher.apply_keystream(&mut buffer);
     buffer
 }
@@ -127,15 +137,15 @@ pub fn generate_filler(
 
     for (i, (data, keys)) in hops_data.iter().zip(hops_keys.iter()).enumerate() {
         let mut chacha = ChaCha20::new(&keys.rho.into(), &[0u8; 12].into());
-        for _ in 0..(ONION_PAYLOAD_LEN - pos) {
+        for _ in 0..(ONION_PACKET_DATA_LEN - pos) {
             let mut dummy = [0; 1];
             chacha.apply_keystream(&mut dummy);
         }
 
         // 32 for mac
         pos += data.len() + 32;
-        if pos > ONION_PAYLOAD_LEN {
-            return Err(SphinxError::PacketSizeTooLarge);
+        if pos > ONION_PACKET_DATA_LEN {
+            return Err(SphinxError::PacketLenTooLarge);
         }
 
         if i == hops_data.len() - 1 {
@@ -149,21 +159,77 @@ pub fn generate_filler(
     Ok(filler)
 }
 
-pub fn new_onion_packet(
-    _payment_path: Vec<PublicKey>,
-    _session_key: SecretKey,
-    _hops_data: Vec<Vec<u8>>,
-    _assoc_data: Vec<u8>,
+#[inline]
+fn shift_slice_right(arr: &mut [u8], amt: usize) {
+    for i in (amt..arr.len()).rev() {
+        arr[i] = arr[i - amt];
+    }
+    for i in 0..amt {
+        arr[i] = 0;
+    }
+}
+
+fn construct_onion_packet(
+    mut packet_data: [u8; ONION_PACKET_DATA_LEN],
+    hops_keys: &[HopKeys],
+    hops_data: &[Vec<u8>],
+    assoc_data: Option<Vec<u8>>,
+    filler: Vec<u8>,
 ) -> Result<OnionPacket, SphinxError> {
+    let mut hmac = [0; 32];
+
+    for (i, (data, keys)) in hops_data.iter().zip(hops_keys.iter()).rev().enumerate() {
+        let data_len = data.len();
+        shift_slice_right(&mut packet_data, data_len + 32);
+        packet_data[0..data_len].copy_from_slice(&data);
+        packet_data[data_len..(data_len + 32)].copy_from_slice(&hmac);
+
+        let mut chacha = ChaCha20::new(&keys.rho.into(), &[0u8; 12].into());
+        chacha.apply_keystream(&mut packet_data);
+
+        if i == 0 {
+            let stop_index = ONION_PACKET_DATA_LEN;
+            let start_index = stop_index
+                .checked_sub(filler.len())
+                .ok_or(SphinxError::FillerLenTooLarge)?;
+            packet_data[start_index..stop_index].copy_from_slice(&filler[..]);
+        }
+
+        let mut hmac_engine = Hmac::<Sha256>::new_from_slice(&keys.mu).expect("valid hmac key");
+        hmac_engine.update(&packet_data);
+        if let Some(ref assoc_data) = assoc_data {
+            hmac_engine.update(assoc_data);
+        }
+        hmac = hmac_engine.finalize().into_bytes().into();
+    }
+
     Ok(OnionPacket {
         version: 0,
-        public_key: PublicKey::from_str(
-            "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619",
-        )
-        .unwrap(),
-        payload: [0u8; ONION_PAYLOAD_LEN],
-        hmac: [0u8; 32],
+        public_key: hops_keys.first().unwrap().ephemeral_public_key,
+        packet_data,
+        hmac,
     })
+}
+
+pub fn new_onion_packet(
+    payment_path: Vec<PublicKey>,
+    session_key: SecretKey,
+    hops_data: Vec<Vec<u8>>,
+    assoc_data: Option<Vec<u8>>,
+) -> Result<OnionPacket, SphinxError> {
+    if payment_path.len() != hops_data.len() {
+        return Err(SphinxError::HopsLenMismatch);
+    }
+    if payment_path.is_empty() {
+        return Err(SphinxError::HopsIsEmpty);
+    }
+
+    let hops_keys = derive_hops_keys(&payment_path, session_key, &Secp256k1::new());
+    let pad_key = derive_key(HMAC_KEY_PAD, &session_key.secret_bytes());
+    let packet_data = generate_padding_data(&pad_key);
+    let filler = generate_filler(&hops_keys, &hops_data)?;
+
+    construct_onion_packet(packet_data, &hops_keys, &hops_data, assoc_data, filler)
 }
 
 #[cfg(test)]
@@ -196,24 +262,6 @@ mod tests {
             Vec::from_hex("1202022710040203e806080000000000000004").unwrap(),
             Vec::from_hex("fd011002022710040203e8082224a33562c54507a9334e79f0dc4f17d407e6d7c61f0e2f3d0d38599502f617042710fd012de02a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a").unwrap(),
         ]
-    }
-
-    #[test]
-    fn it_works() {
-        let payment_path = get_test_payment_path();
-        let session_key = get_test_session_key();
-        let hops_data = vec![
-            Vec::from_hex("1202023a98040205dc06080000000000000001").unwrap(),
-            Vec::from_hex("52020236b00402057806080000000000000002fd02013c0102030405060708090a0b0c0d0e0f0102030405060708090a0b0c0d0e0f0102030405060708090a0b0c0d0e0f0102030405060708090a0b0c0d0e0f").unwrap(),
-            Vec::from_hex("12020230d4040204e206080000000000000003").unwrap(),
-            Vec::from_hex("1202022710040203e806080000000000000004").unwrap(),
-            Vec::from_hex("fd011002022710040203e8082224a33562c54507a9334e79f0dc4f17d407e6d7c61f0e2f3d0d38599502f617042710fd012de02a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a").unwrap(),
-        ];
-        let assoc_data = vec![0x42u8; 32];
-
-        let packet = new_onion_packet(payment_path, session_key, hops_data, assoc_data).unwrap();
-        let hex = "0002eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619f7f3416a5aa36dc7eeb3ec6d421e9615471ab870a33ac07fa5d5a51df0a8823aabe3fea3f90d387529d4f72837f9e687230371ccd8d263072206dbed0234f6505e21e282abd8c0e4f5b9ff8042800bbab065036eadd0149b37f27dde664725a49866e052e809d2b0198ab9610faa656bbf4ec516763a59f8f42c171b179166ba38958d4f51b39b3e98706e2d14a2dafd6a5df808093abfca5aeaaca16eded5db7d21fb0294dd1a163edf0fb445d5c8d7d688d6dd9c541762bf5a5123bf9939d957fe648416e88f1b0928bfa034982b22548e1a4d922690eecf546275afb233acf4323974680779f1a964cfe687456035cc0fba8a5428430b390f0057b6d1fe9a8875bfa89693eeb838ce59f09d207a503ee6f6299c92d6361bc335fcbf9b5cd44747aadce2ce6069cfdc3d671daef9f8ae590cf93d957c9e873e9a1bc62d9640dc8fc39c14902d49a1c80239b6c5b7fd91d05878cbf5ffc7db2569f47c43d6c0d27c438abff276e87364deb8858a37e5a62c446af95d8b786eaf0b5fcf78d98b41496794f8dcaac4eef34b2acfb94c7e8c32a9e9866a8fa0b6f2a06f00a1ccde569f97eec05c803ba7500acc96691d8898d73d8e6a47b8f43c3d5de74458d20eda61474c426359677001fbd75a74d7d5db6cb4feb83122f133206203e4e2d293f838bf8c8b3a29acb321315100b87e80e0edb272ee80fda944e3fb6084ed4d7f7c7d21c69d9da43d31a90b70693f9b0cc3eac74c11ab8ff655905688916cfa4ef0bd04135f2e50b7c689a21d04e8e981e74c6058188b9b1f9dfc3eec6838e9ffbcf22ce738d8a177c19318dffef090cee67e12de1a3e2a39f61247547ba5257489cbc11d7d91ed34617fcc42f7a9da2e3cf31a94a210a1018143173913c38f60e62b24bf0d7518f38b5bab3e6a1f8aeb35e31d6442c8abb5178efc892d2e787d79c6ad9e2fc271792983fa9955ac4d1d84a36c024071bc6e431b625519d556af38185601f70e29035ea6a09c8b676c9d88cf7e05e0f17098b584c4168735940263f940033a220f40be4c85344128b14beb9e75696db37014107801a59b13e89cd9d2258c169d523be6d31552c44c82ff4bb18ec9f099f3bf0e5b1bb2ba9a87d7e26f98d294927b600b5529c47e04d98956677cbcee8fa2b60f49776d8b8c367465b7c626da53700684fb6c918ead0eab8360e4f60edd25b4f43816a75ecf70f909301825b512469f8389d79402311d8aecb7b3ef8599e79485a4388d87744d899f7c47ee644361e17040a7958c8911be6f463ab6a9b2afacd688ec55ef517b38f1339efc54487232798bb25522ff4572ff68567fe830f92f7b8113efce3e98c3fffbaedce4fd8b50e41da97c0c08e423a72689cc68e68f752a5e3a9003e64e35c957ca2e1c48bb6f64b05f56b70b575ad2f278d57850a7ad568c24a4d32a3d74b29f03dc125488bc7c637da582357f40b0a52d16b3b40bb2c2315d03360bc24209e20972c200566bcf3bbe5c5b0aedd83132a8a4d5b4242ba370b6d67d9b67eb01052d132c7866b9cb502e44796d9d356e4e3cb47cc527322cd24976fe7c9257a2864151a38e568ef7a79f10d6ef27cc04ce382347a2488b1f404fdbf407fe1ca1c9d0d5649e34800e25e18951c98cae9f43555eef65fee1ea8f15828807366c3b612cd5753bf9fb8fced08855f742cddd6f765f74254f03186683d646e6f09ac2805586c7cf11998357cafc5df3f285329366f475130c928b2dceba4aa383758e7a9d20705c4bb9db619e2992f608a1ba65db254bb389468741d0502e2588aeb54390ac600c19af5c8e61383fc1bebe0029e4474051e4ef908828db9cca13277ef65db3fd47ccc2179126aaefb627719f421e20";
-        assert_eq!(packet.into_bytes().len(), hex.len() / 2);
     }
 
     #[test]
@@ -342,5 +390,26 @@ mod tests {
         assert!(filler.is_ok());
         let expected_hex = "51c30cc8f20da0153ca3839b850bcbc8fefc7fd84802f3e78cb35a660e747b57aa5b0de555cbcf1e6f044a718cc34219b96597f3684eee7a0232e1754f638006cb15a14788217abdf1bdd67910dc1ca74a05dcce8b5ad841b0f939fca8935f6a3ff660e0efb409f1a24ce4aa16fc7dc074cd84422c10cc4dd4fc150dd6d1e4f50b36ce10fef29248dd0cec85c72eb3e4b2f4a7c03b5c9e0c9dd12976553ede3d0e295f842187b33ff743e6d685075e98e1bcab8a46bff0102ca8b2098ae91798d370b01ca7076d3d626952a03663fe8dc700d1358263b73ba30e36731a0b72092f8d5bc8cd346762e93b2bf203d00264e4bc136fc142de8f7b69154deb05854ea88e2d7506222c95ba1aab06";
         assert_eq!(filler.unwrap().to_lower_hex_string(), expected_hex);
+    }
+
+    #[test]
+    fn test_new_onion_packet() {
+        let payment_path = get_test_payment_path();
+        let session_key = get_test_session_key();
+        let hops_data = vec![
+            Vec::from_hex("1202023a98040205dc06080000000000000001").unwrap(),
+            Vec::from_hex("52020236b00402057806080000000000000002fd02013c0102030405060708090a0b0c0d0e0f0102030405060708090a0b0c0d0e0f0102030405060708090a0b0c0d0e0f0102030405060708090a0b0c0d0e0f").unwrap(),
+            Vec::from_hex("12020230d4040204e206080000000000000003").unwrap(),
+            Vec::from_hex("1202022710040203e806080000000000000004").unwrap(),
+            Vec::from_hex("fd011002022710040203e8082224a33562c54507a9334e79f0dc4f17d407e6d7c61f0e2f3d0d38599502f617042710fd012de02a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a").unwrap(),
+        ];
+        let assoc_data = vec![0x42u8; 32];
+
+        let packet =
+            new_onion_packet(payment_path, session_key, hops_data, Some(assoc_data)).unwrap();
+        let packet_bytes = packet.into_bytes();
+        let expected_hex = "0002eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619f7f3416a5aa36dc7eeb3ec6d421e9615471ab870a33ac07fa5d5a51df0a8823aabe3fea3f90d387529d4f72837f9e687230371ccd8d263072206dbed0234f6505e21e282abd8c0e4f5b9ff8042800bbab065036eadd0149b37f27dde664725a49866e052e809d2b0198ab9610faa656bbf4ec516763a59f8f42c171b179166ba38958d4f51b39b3e98706e2d14a2dafd6a5df808093abfca5aeaaca16eded5db7d21fb0294dd1a163edf0fb445d5c8d7d688d6dd9c541762bf5a5123bf9939d957fe648416e88f1b0928bfa034982b22548e1a4d922690eecf546275afb233acf4323974680779f1a964cfe687456035cc0fba8a5428430b390f0057b6d1fe9a8875bfa89693eeb838ce59f09d207a503ee6f6299c92d6361bc335fcbf9b5cd44747aadce2ce6069cfdc3d671daef9f8ae590cf93d957c9e873e9a1bc62d9640dc8fc39c14902d49a1c80239b6c5b7fd91d05878cbf5ffc7db2569f47c43d6c0d27c438abff276e87364deb8858a37e5a62c446af95d8b786eaf0b5fcf78d98b41496794f8dcaac4eef34b2acfb94c7e8c32a9e9866a8fa0b6f2a06f00a1ccde569f97eec05c803ba7500acc96691d8898d73d8e6a47b8f43c3d5de74458d20eda61474c426359677001fbd75a74d7d5db6cb4feb83122f133206203e4e2d293f838bf8c8b3a29acb321315100b87e80e0edb272ee80fda944e3fb6084ed4d7f7c7d21c69d9da43d31a90b70693f9b0cc3eac74c11ab8ff655905688916cfa4ef0bd04135f2e50b7c689a21d04e8e981e74c6058188b9b1f9dfc3eec6838e9ffbcf22ce738d8a177c19318dffef090cee67e12de1a3e2a39f61247547ba5257489cbc11d7d91ed34617fcc42f7a9da2e3cf31a94a210a1018143173913c38f60e62b24bf0d7518f38b5bab3e6a1f8aeb35e31d6442c8abb5178efc892d2e787d79c6ad9e2fc271792983fa9955ac4d1d84a36c024071bc6e431b625519d556af38185601f70e29035ea6a09c8b676c9d88cf7e05e0f17098b584c4168735940263f940033a220f40be4c85344128b14beb9e75696db37014107801a59b13e89cd9d2258c169d523be6d31552c44c82ff4bb18ec9f099f3bf0e5b1bb2ba9a87d7e26f98d294927b600b5529c47e04d98956677cbcee8fa2b60f49776d8b8c367465b7c626da53700684fb6c918ead0eab8360e4f60edd25b4f43816a75ecf70f909301825b512469f8389d79402311d8aecb7b3ef8599e79485a4388d87744d899f7c47ee644361e17040a7958c8911be6f463ab6a9b2afacd688ec55ef517b38f1339efc54487232798bb25522ff4572ff68567fe830f92f7b8113efce3e98c3fffbaedce4fd8b50e41da97c0c08e423a72689cc68e68f752a5e3a9003e64e35c957ca2e1c48bb6f64b05f56b70b575ad2f278d57850a7ad568c24a4d32a3d74b29f03dc125488bc7c637da582357f40b0a52d16b3b40bb2c2315d03360bc24209e20972c200566bcf3bbe5c5b0aedd83132a8a4d5b4242ba370b6d67d9b67eb01052d132c7866b9cb502e44796d9d356e4e3cb47cc527322cd24976fe7c9257a2864151a38e568ef7a79f10d6ef27cc04ce382347a2488b1f404fdbf407fe1ca1c9d0d5649e34800e25e18951c98cae9f43555eef65fee1ea8f15828807366c3b612cd5753bf9fb8fced08855f742cddd6f765f74254f03186683d646e6f09ac2805586c7cf11998357cafc5df3f285329366f475130c928b2dceba4aa383758e7a9d20705c4bb9db619e2992f608a1ba65db254bb389468741d0502e2588aeb54390ac600c19af5c8e61383fc1bebe0029e4474051e4ef908828db9cca13277ef65db3fd47ccc2179126aaefb627719f421e20";
+        assert_eq!(packet_bytes.len(), expected_hex.len() / 2);
+        assert_eq!(packet_bytes.to_lower_hex_string(), expected_hex);
     }
 }
