@@ -332,8 +332,7 @@ fn generate_filler(hops_keys: &[HopKeys], hops_data: &[Vec<u8>]) -> Result<Vec<u
     for (i, (data, keys)) in hops_data.iter().zip(hops_keys.iter()).enumerate() {
         let mut chacha = ChaCha20::new(&keys.rho.into(), &[0u8; 12].into());
 
-        // For each hop, generate 1300 bytes of random data from the cipher stream. Drop the first
-        // ONION_PACKET_DATA_LEN bytes and apply the rest to the filler.
+        // Skip `ONION_PACKET_DATA_LEN - pos` bytes in the stream
         for _ in 0..(ONION_PACKET_DATA_LEN - pos) {
             let mut dummy = [0; 1];
             chacha.apply_keystream(&mut dummy);
