@@ -1,9 +1,83 @@
+//!
+//! ## Example
+//!
+//! ```rust
+//! use secp256k1::{PublicKey, SecretKey, Secp256k1};
+//! use fiber_sphinx::{new_onion_packet, SphinxError};
+//!
+//! let secp = Secp256k1::new();
+//! let hops_keys = vec![
+//!     SecretKey::from_slice(&[0x20; 32]).expect("32 bytes, within curve order"),
+//!     SecretKey::from_slice(&[0x21; 32]).expect("32 bytes, within curve order"),
+//!     SecretKey::from_slice(&[0x22; 32]).expect("32 bytes, within curve order"),
+//! ];
+//! let hops_path = hops_keys.iter().map(|sk| sk.public_key(&secp)).collect();
+//! let session_key = SecretKey::from_slice(&[0x41; 32]).expect("32 bytes, within curve order");
+//! // Use the first byte to indicate the data len
+//! let hops_data = vec![vec![0], vec![1, 0], vec![5, 0, 1, 2, 3, 4]];
+//! let get_length = |packet_data: &[u8]| Some(packet_data[0] as usize + 1);
+//! let assoc_data = vec![0x42u8; 32];
+
+//! let packet = new_onion_packet(
+//!     hops_path,
+//!     session_key,
+//!     hops_data.clone(),
+//!     Some(assoc_data.clone()),
+//! ).expect("new onion packet");
+//!
+//! // Hop 0
+//! # {
+//! #     // error cases
+//! #     let res = packet.clone().peel(&hops_keys[0], None, &secp, get_length);
+//! #     assert_eq!(res, Err(SphinxError::HmacMismatch));
+//! #     let res = packet
+//! #         .clone()
+//! #         .peel(&hops_keys[0], Some(&assoc_data), &secp, |_| None);
+//! #     assert_eq!(res, Err(SphinxError::HopDataLenUnavailable));
+//! # }
+//! let res = packet.peel(&hops_keys[0], Some(&assoc_data), &secp, get_length);
+//! assert!(res.is_ok());
+//! let (data, packet) = res.unwrap();
+//! assert_eq!(data, hops_data[0]);
+//!
+//! // Hop 1
+//! # {
+//! #     // error cases
+//! #     let res = packet.clone().peel(&hops_keys[1], None, &secp, get_length);
+//! #     assert_eq!(res, Err(SphinxError::HmacMismatch));
+//! #     let res = packet
+//! #         .clone()
+//! #         .peel(&hops_keys[1], Some(&assoc_data), &secp, |_| None);
+//! #     assert_eq!(res, Err(SphinxError::HopDataLenUnavailable));
+//! # }
+//! let res = packet.peel(&hops_keys[1], Some(&assoc_data), &secp, get_length);
+//! assert!(res.is_ok());
+//! let (data, packet) = res.unwrap();
+//! assert_eq!(data, hops_data[1]);
+//!
+//! // Hop 2
+//! # {
+//! #     // error cases
+//! #     let res = packet.clone().peel(&hops_keys[2], None, &secp, get_length);
+//! #     assert_eq!(res, Err(SphinxError::HmacMismatch));
+//! #     let res = packet
+//! #         .clone()
+//! #         .peel(&hops_keys[2], Some(&assoc_data), &secp, |_| None);
+//! #     assert_eq!(res, Err(SphinxError::HopDataLenUnavailable));
+//! # }
+//! let res = packet.peel(&hops_keys[2], Some(&assoc_data), &secp, get_length);
+//! assert!(res.is_ok());
+//! let (data, _packet) = res.unwrap();
+//! assert_eq!(data, hops_data[2]);
+//! ```
 use chacha20::{
     cipher::{KeyIvInit as _, StreamCipher as _},
     ChaCha20,
 };
 use hmac::{Hmac, Mac as _};
-use secp256k1::{ecdh::SharedSecret, PublicKey, Scalar, Secp256k1, SecretKey, Signing};
+use secp256k1::{
+    ecdh::SharedSecret, PublicKey, Scalar, Secp256k1, SecretKey, Signing, Verification,
+};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
@@ -12,8 +86,9 @@ pub const ONION_PACKET_DATA_LEN: usize = 1300;
 const HMAC_KEY_RHO: &[u8] = b"rho";
 const HMAC_KEY_MU: &[u8] = b"mu";
 const HMAC_KEY_PAD: &[u8] = b"pad";
+const CHACHA_NONCE: [u8; 12] = [0u8; 12];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct OnionPacket {
     // Version of the onion packet, currently 0
     pub version: u8,
@@ -38,24 +113,56 @@ impl OnionPacket {
 
     /// Peels the onion packet at the current hop.
     ///
-    /// - `private_key`: the node private key.
+    /// - `secret_key`: the node private key.
     /// - `assoc_data`: The associated data. It was covered by the onion packet's HMAC.
-    pub fn peel(
+    /// - `get_hop_data_len`: Tell the hop data len given the decrypted packet data for the current hop.
+    pub fn peel<C, F>(
         self,
-        private_key: &SecretKey,
+        secret_key: &SecretKey,
         assoc_data: Option<&[u8]>,
-    ) -> Result<(), SphinxError> {
-        let shared_secret = SharedSecret::new(&self.public_key, private_key);
-        // let rho = derive_key(HMAC_KEY_RHO, shared_secret.as_ref());
+        secp_ctx: &Secp256k1<C>,
+        get_hop_data_len: F,
+    ) -> Result<(Vec<u8>, Self), SphinxError>
+    where
+        C: Verification,
+        F: FnOnce(&[u8]) -> Option<usize>,
+    {
+        let shared_secret = SharedSecret::new(&self.public_key, secret_key);
+        let rho = derive_key(HMAC_KEY_RHO, shared_secret.as_ref());
         let mu = derive_key(HMAC_KEY_MU, shared_secret.as_ref());
 
         let expected_hmac = compute_hmac(&mu, &self.packet_data, assoc_data);
+
         // TODO: constant time comparison
         if expected_hmac != self.hmac {
             return Err(SphinxError::HmacMismatch);
         }
 
-        Ok(())
+        let mut chacha = ChaCha20::new(&rho.into(), &CHACHA_NONCE.into());
+        let mut packet_data = self.packet_data;
+        chacha.apply_keystream(&mut packet_data[..]);
+
+        // data | hmac | remaining
+        let data_len = get_hop_data_len(&packet_data).ok_or(SphinxError::HopDataLenUnavailable)?;
+        let hop_data = (&packet_data[0..data_len]).to_vec();
+        let mut hmac = [0; 32];
+        hmac.copy_from_slice(&packet_data[data_len..(data_len + 32)]);
+        shift_slice_left(&mut packet_data[..], data_len + 32);
+        // Encrypt 0 bytes until the end
+        chacha.apply_keystream(&mut packet_data[(ONION_PACKET_DATA_LEN - data_len - 32)..]);
+
+        let public_key =
+            derive_next_hop_ephemeral_public_key(self.public_key, shared_secret.as_ref(), secp_ctx);
+
+        Ok((
+            hop_data,
+            OnionPacket {
+                version: self.version,
+                public_key,
+                packet_data,
+                hmac,
+            },
+        ))
     }
 }
 
@@ -75,6 +182,9 @@ pub enum SphinxError {
 
     #[error("The HMAC does not match the packet data and optional assoc data")]
     HmacMismatch,
+
+    #[error("Unable to parse the data len for the current hop")]
+    HopDataLenUnavailable,
 }
 
 #[inline]
@@ -83,6 +193,17 @@ fn shift_slice_right(arr: &mut [u8], amt: usize) {
         arr[i] = arr[i - amt];
     }
     for i in 0..amt {
+        arr[i] = 0;
+    }
+}
+
+#[inline]
+fn shift_slice_left(arr: &mut [u8], amt: usize) {
+    let pivot = arr.len() - amt;
+    for i in 0..pivot {
+        arr[i] = arr[i + amt];
+    }
+    for i in pivot..arr.len() {
         arr[i] = 0;
     }
 }
@@ -123,6 +244,26 @@ fn derive_next_hop_ephemeral_secret_key(
 
     ephemeral_secret_key
         .mul_tweak(&Scalar::from_be_bytes(blinding_factor).expect("valid scalar"))
+        .expect("valid mul tweak")
+}
+
+fn derive_next_hop_ephemeral_public_key<C: Verification>(
+    ephemeral_public_key: PublicKey,
+    shared_secret: &[u8],
+    secp_ctx: &Secp256k1<C>,
+) -> PublicKey {
+    let blinding_factor: [u8; 32] = {
+        let mut sha = Sha256::new();
+        sha.update(&ephemeral_public_key.serialize()[..]);
+        sha.update(shared_secret.as_ref());
+        sha.finalize().into()
+    };
+
+    ephemeral_public_key
+        .mul_tweak(
+            secp_ctx,
+            &Scalar::from_be_bytes(blinding_factor).expect("valid scalar"),
+        )
         .expect("valid mul tweak")
 }
 
@@ -177,7 +318,7 @@ fn derive_key(hmac_key: &[u8], shared_secret: &[u8]) -> [u8; 32] {
 ///
 /// Uses Chacha as the PRG. The key is derived from the session key using HMAC, and the nonce is all zeros.
 fn generate_padding_data(pad_key: &[u8]) -> [u8; ONION_PACKET_DATA_LEN] {
-    let mut cipher = ChaCha20::new(pad_key.into(), &[0u8; 12].into());
+    let mut cipher = ChaCha20::new(pad_key.into(), &CHACHA_NONCE.into());
     let mut buffer = [0u8; ONION_PACKET_DATA_LEN];
     cipher.apply_keystream(&mut buffer);
     buffer
@@ -468,32 +609,5 @@ mod tests {
         let expected_hex = "0002eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619f7f3416a5aa36dc7eeb3ec6d421e9615471ab870a33ac07fa5d5a51df0a8823aabe3fea3f90d387529d4f72837f9e687230371ccd8d263072206dbed0234f6505e21e282abd8c0e4f5b9ff8042800bbab065036eadd0149b37f27dde664725a49866e052e809d2b0198ab9610faa656bbf4ec516763a59f8f42c171b179166ba38958d4f51b39b3e98706e2d14a2dafd6a5df808093abfca5aeaaca16eded5db7d21fb0294dd1a163edf0fb445d5c8d7d688d6dd9c541762bf5a5123bf9939d957fe648416e88f1b0928bfa034982b22548e1a4d922690eecf546275afb233acf4323974680779f1a964cfe687456035cc0fba8a5428430b390f0057b6d1fe9a8875bfa89693eeb838ce59f09d207a503ee6f6299c92d6361bc335fcbf9b5cd44747aadce2ce6069cfdc3d671daef9f8ae590cf93d957c9e873e9a1bc62d9640dc8fc39c14902d49a1c80239b6c5b7fd91d05878cbf5ffc7db2569f47c43d6c0d27c438abff276e87364deb8858a37e5a62c446af95d8b786eaf0b5fcf78d98b41496794f8dcaac4eef34b2acfb94c7e8c32a9e9866a8fa0b6f2a06f00a1ccde569f97eec05c803ba7500acc96691d8898d73d8e6a47b8f43c3d5de74458d20eda61474c426359677001fbd75a74d7d5db6cb4feb83122f133206203e4e2d293f838bf8c8b3a29acb321315100b87e80e0edb272ee80fda944e3fb6084ed4d7f7c7d21c69d9da43d31a90b70693f9b0cc3eac74c11ab8ff655905688916cfa4ef0bd04135f2e50b7c689a21d04e8e981e74c6058188b9b1f9dfc3eec6838e9ffbcf22ce738d8a177c19318dffef090cee67e12de1a3e2a39f61247547ba5257489cbc11d7d91ed34617fcc42f7a9da2e3cf31a94a210a1018143173913c38f60e62b24bf0d7518f38b5bab3e6a1f8aeb35e31d6442c8abb5178efc892d2e787d79c6ad9e2fc271792983fa9955ac4d1d84a36c024071bc6e431b625519d556af38185601f70e29035ea6a09c8b676c9d88cf7e05e0f17098b584c4168735940263f940033a220f40be4c85344128b14beb9e75696db37014107801a59b13e89cd9d2258c169d523be6d31552c44c82ff4bb18ec9f099f3bf0e5b1bb2ba9a87d7e26f98d294927b600b5529c47e04d98956677cbcee8fa2b60f49776d8b8c367465b7c626da53700684fb6c918ead0eab8360e4f60edd25b4f43816a75ecf70f909301825b512469f8389d79402311d8aecb7b3ef8599e79485a4388d87744d899f7c47ee644361e17040a7958c8911be6f463ab6a9b2afacd688ec55ef517b38f1339efc54487232798bb25522ff4572ff68567fe830f92f7b8113efce3e98c3fffbaedce4fd8b50e41da97c0c08e423a72689cc68e68f752a5e3a9003e64e35c957ca2e1c48bb6f64b05f56b70b575ad2f278d57850a7ad568c24a4d32a3d74b29f03dc125488bc7c637da582357f40b0a52d16b3b40bb2c2315d03360bc24209e20972c200566bcf3bbe5c5b0aedd83132a8a4d5b4242ba370b6d67d9b67eb01052d132c7866b9cb502e44796d9d356e4e3cb47cc527322cd24976fe7c9257a2864151a38e568ef7a79f10d6ef27cc04ce382347a2488b1f404fdbf407fe1ca1c9d0d5649e34800e25e18951c98cae9f43555eef65fee1ea8f15828807366c3b612cd5753bf9fb8fced08855f742cddd6f765f74254f03186683d646e6f09ac2805586c7cf11998357cafc5df3f285329366f475130c928b2dceba4aa383758e7a9d20705c4bb9db619e2992f608a1ba65db254bb389468741d0502e2588aeb54390ac600c19af5c8e61383fc1bebe0029e4474051e4ef908828db9cca13277ef65db3fd47ccc2179126aaefb627719f421e20";
         assert_eq!(packet_bytes.len(), expected_hex.len() / 2);
         assert_eq!(packet_bytes.to_lower_hex_string(), expected_hex);
-    }
-
-    #[test]
-    fn test_peel_onion_packet() {
-        let secp = Secp256k1::new();
-        let hops_keys = vec![
-            SecretKey::from_slice(&[0x20; 32]).expect("32 bytes, within curve order"),
-            SecretKey::from_slice(&[0x21; 32]).expect("32 bytes, within curve order"),
-            SecretKey::from_slice(&[0x22; 32]).expect("32 bytes, within curve order"),
-        ];
-        let hops_path = hops_keys.iter().map(|sk| sk.public_key(&secp)).collect();
-        let session_key = get_test_session_key();
-        let hops_data = vec![vec![0], vec![1], vec![2]];
-        let assoc_data = vec![0x42u8; 32];
-
-        let packet =
-            new_onion_packet(hops_path, session_key, hops_data, Some(assoc_data.clone())).unwrap();
-        {
-            let res = packet
-                .clone()
-                .peel(&hops_keys[0], Some(assoc_data.as_ref()));
-            assert_eq!(res, Ok(()));
-        }
-        {
-            let res = packet.clone().peel(&hops_keys[0], None);
-            assert_eq!(res, Err(SphinxError::HmacMismatch));
-        }
     }
 }
