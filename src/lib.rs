@@ -121,6 +121,9 @@ impl OnionPacket {
     /// - `secret_key`: the node private key. _x_<sub>i</sub> in the specification.
     /// - `assoc_data`: The associated data. It was covered by the onion packet's HMAC. _A_ in the specification.
     /// - `get_hop_data_len`: Tell the hop data len given the decrypted packet data for the current hop.
+    ///
+    /// Returns a tuple (m, p) where m is the hop data for the current hop, and p is remaining onion packet for
+    /// the next hop.
     pub fn peel<C, F>(
         self,
         secret_key: &SecretKey,
