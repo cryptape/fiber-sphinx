@@ -2,6 +2,10 @@
 name = "fiber-sphinx"
 version = "0.1.1"
 edition = "2021"
+license-file = "COPYING.md"
+description = "A Rust implementation of the Sphinx mix network."
+documentation = "https://docs.rs/fiber-sphinx"
+homepage = "https://github.com/cryptape/fiberer-sphinx"
 
 [dependencies]
 secp256k1 = { version = "0.28.0", features = ["serde"] }
