@@ -17,7 +17,7 @@ The route is established by the origin node, which possesses the public keys of 
 
 Assume that the origin node wants to send the message $m_{v-1}$ to node $n_{v-1}$ and it has found a path $(n_0, n_1, \cdots, n_{v-1})$ where $n_0, n_1, \cdots, n_{v-2}$ are forwarding nodes. The data $m_0, m_1, \cdots, m_{v-2}$ are control messages sent to forwarding nodes where $m_i$ is the control message for the node $n_i$. The origin node can optionally attach the associated data $A$ that all the nodes can verify the integrity of the associated data $A$.
 
-Each node $n_i$ has a secp256k1 private key $x_i$. The origin node knows the corresponding public keys $y_i = G^{x_i}$ for each node.
+Each node $n_i$ has a secp256k1 private key $x_i$. The origin node knows the corresponding public keys $y_i = g^{x_i}$ for each node.
 
 $L$ is a setup constant that the origin node must create a packet of length $L$ for $n_0$, and each forwarding node will construct the forwarding packet of length $L$ as well. $L$ must be larger enough to hold the messages $m_0, m_1, \cdots, m_{v-1}$ plus $32v$ bytes of HMACs for integrity verification.
 
