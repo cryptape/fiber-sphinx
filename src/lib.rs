@@ -1,3 +1,9 @@
+//! A Rust implementation of [Sphinx][] (a.k.a. Onion Message) for [Fiber][].
+//!
+//! [Sphinx]: http://www.cypherpunks.ca/~iang/pubs/Sphinx_Oakland09.pdf
+//! [Fiber]: https://github.com/nervosnetwork/fiber
+//!
+//! See more in the [Specification](https://github.com/cryptape/fiber-sphinx/blob/develop/docs/spec.md).
 //!
 //! ## Example
 //!
@@ -89,13 +95,13 @@ const CHACHA_NONCE: [u8; 12] = [0u8; 12];
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct OnionPacket {
-    // Version of the onion packet, currently 0
+    /// Version of the onion packet, currently 0
     pub version: u8,
-    // The public key of the next hop
+    /// The public key of the next hop. _Alpha_ in the specification.
     pub public_key: PublicKey,
-    // Encrypted packet data
+    /// Encrypted packet data. _Beta_ in the specification.
     pub packet_data: Vec<u8>,
-    // HMAC of the packet data
+    /// HMAC of the packet data. _Gamma_ in the specification.
     pub hmac: [u8; 32],
 }
 
@@ -112,9 +118,12 @@ impl OnionPacket {
 
     /// Peels the onion packet at the current hop.
     ///
-    /// - `secret_key`: the node private key.
-    /// - `assoc_data`: The associated data. It was covered by the onion packet's HMAC.
+    /// - `secret_key`: the node private key. _x_<sub>i</sub> in the specification.
+    /// - `assoc_data`: The associated data. It was covered by the onion packet's HMAC. _A_ in the specification.
     /// - `get_hop_data_len`: Tell the hop data len given the decrypted packet data for the current hop.
+    ///
+    /// Returns a tuple (m, p) where m is the hop data for the current hop, and p is remaining onion packet for
+    /// the next hop.
     pub fn peel<C, F>(
         self,
         secret_key: &SecretKey,
@@ -234,7 +243,8 @@ fn forward_stream_cipher<S: StreamCipher>(stream: &mut S, n: usize) {
 ///
 /// - `ephemeral_secret_key`: the ephemeral secret key of the current node $n_{i-1}$,
 ///     which is x times the blinding factors so far: $x b_0 b_1 \cdots b_{i-2}$
-/// - `ephemeral_public_key`: the corresponding public key of `ephemeral_secret_key`
+/// - `ephemeral_public_key`: the corresponding public key of `ephemeral_secret_key`.
+///     This is the _alpha_ in the specification.
 /// - `shared_secret`: the shared secret of the current node $s_{i-1}$
 ///
 /// Returns the ephemeral secret key for the mix node $n_i$, which is $x b_0 b_1 \cdots b_{i-1}$.
@@ -255,6 +265,9 @@ fn derive_next_hop_ephemeral_secret_key(
         .expect("valid mul tweak")
 }
 
+/// Derives the ephemeral public key for the next hop.
+///
+/// This is the _alpha_ in the specification.
 fn derive_next_hop_ephemeral_public_key<C: Verification>(
     ephemeral_public_key: PublicKey,
     shared_secret: &[u8],
@@ -277,7 +290,7 @@ fn derive_next_hop_ephemeral_public_key<C: Verification>(
 
 // Keys manager for each hop
 struct HopKeys {
-    /// Ephemeral public key for the hop
+    /// Ephemeral public key for the hop. The _alpha_ in the specification.
     ephemeral_public_key: PublicKey,
     /// Key derived from the shared secret for the hop. It is used to encrypt the packet data.
     rho: [u8; 32],
@@ -410,13 +423,15 @@ fn construct_onion_packet(
 /// Creates a new onion packet internally.
 ///
 /// - `onion_packet_len`: The length of the onion packet. The packet has the same size for each hop.
-/// - `hops_path`: The public keys for each hop.
+/// - `hops_path`: The public keys for each hop. These are _y_<sub>i</sub> in the specification.
 /// - `session_key`: The ephemeral secret key for the onion packet. It must be generated securely using a random process.
+///     This is _x_ in the specification.
 /// - `hops_data`: The unencrypted data for each hop. **Attention** that the data for each hop will be concatenated with
 ///     the remaining encrypted data. To extract the data, the receiver must know the data length. For example, the hops
-///     data can include its length at the beginning.
+///     data can include its length at the beginning. These are _m_<sub>i</sub> in the specification.
 /// - `assoc_data`: The associated data. It will not be included in the packet itself but will be covered by the packet's
-///     HMAC. This allows each hop to verify that the associated data has not been tampered with.
+///     HMAC. This allows each hop to verify that the associated data has not been tampered with. This is _A_ in the
+///     specification.
 pub fn new_onion_packet(
     packet_data_len: usize,
     hops_path: Vec<PublicKey>,
