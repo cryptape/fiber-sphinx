@@ -166,6 +166,53 @@ This step is illustrated in Figure 3
 
 The Fiber Sphinx dose not define how $n_i$ knows the address of $n_{i+1}$ to send the forwarding message. Usually such information can be obtained from $m_i$.
 
+## Returning Errors
+
+The Sphinx protocol allows encrypted error messages to be returned to the origin node from any hop, including the final node.
+
+The forwarding nodes and the final node must store the shared secret from the forward path and reuse it to obfuscate any corresponding return packet. In addition, each node locally stores data regarding its own sending peer in the route, so it knows where to forward the error packets.
+
+The forwarding and final nodes both store the shared secret from the forward path. They reuse this secret to obfuscate any return packet. Additionally, each node keeps data about its own sending peer in the route, enabling it to know where to forward the error-returning packet.
+
+The node generating the error (erring node) creates a return packet that includes two parts:
+
+- `hmac`: 32 bytes of the HMAC authenticating the `payload`
+- `payload`: variable length bytes of the failure message, usually padded to a constant size to obfuscate the message length.
+
+The erring node then generates two keys from the shared secret:
+
+$$
+\begin{array}{rl}
+\bar{\mu} _ i =& h _ \bar{\mu}(s _ i) \\
+\bar{\gamma} _ i =& h _ \bar{\gamma}(s _ i) \\
+\end{array}
+$$
+
+Where
+
+- $h_\bar{\mu}: (s_i) \to \bar{\mu}_i$ computes HMAC-SHA256 on $s_i$ by using 2 bytes `0x756d` (utf8 encoding of the text "um") as the key.
+- $h_\bar{\gamma}: (s_i) \to \bar{\gamma}_i$ computes HMAC-SHA256 on $s_i$ by using 3 bytes `0x616d6d6167` (utf8 encoding of the text "ammag") as the key.
+
+Finally, the erring node computes the HMAC and encrypt the packet:
+
+- Computes the HMAC of `payload` to get `hmac`: $\mathsf{HMAC\textrm{-}SHA256}(\bar{\mu} _{i}, \textrm{payload})$
+- Concatenate `hmac` and `payload`, then XOR it with the Chacha20 stream: $\\{\textrm{hmac} \Vert \textrm{payload}\\} \oplus \mathsf{Chacha20}(\bar{\gamma}_i)$
+
+When a node $n_{i-1}$ receives the error-returning packet $e_i$ and it is not the original node, it encrypt it with its own $\bar{\gamma}_i$:
+
+$$
+e_{i-1} = e_{i} \oplus \mathsf{Chacha20}(\bar{\gamma}_{i-1})
+$$
+
+The origin node must store the session key $x$ and the route path $(y_0, y_1, \ldots, y_{v-1})$ locally to decrypt the error packet. Using the same procedure in the section Key Generation, the node can get the keys $\bar{\mu}_i$ and $\bar{\gamma}_i$ for each hop.
+
+The origin node must try to decrypt the message until it gets a valid `payload` and the `hmac` matches.
+
+- Let $e$ be the error-returning packet.
+- For $i$ from 0 to $v-1$:
+    - Let $e = e \oplus \mathsf{Chacha20}(\bar{\gamma}_{i})$
+    - If $e[32..\lvert e \rvert]$ is a valid error payload, and $\mathsf{HMAC\textrm{-}SHA256}(\bar{\mu} _{i}, e[32..\lvert e \rvert])$ matches $e[0..32]$, return $e[32..\lvert e \rvert]$ as the decrypted error payload, otherwise continue.
+
 ## Test Vectors
 
 TODO
