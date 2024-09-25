@@ -9,7 +9,7 @@
 //!
 //! ```rust
 //! use secp256k1::{PublicKey, SecretKey, Secp256k1};
-//! use fiber_sphinx::{new_onion_packet, SphinxError};
+//! use fiber_sphinx::OnionPacket;
 //!
 //! let secp = Secp256k1::new();
 //! let hops_keys = vec![
@@ -23,16 +23,18 @@
 //! let hops_data = vec![vec![0], vec![1, 0], vec![5, 0, 1, 2, 3, 4]];
 //! let get_length = |packet_data: &[u8]| Some(packet_data[0] as usize + 1);
 //! let assoc_data = vec![0x42u8; 32];
-
-//! let packet = new_onion_packet(
-//!     1300,
-//!     hops_path,
+//!
+//! let packet = OnionPacket::create(
 //!     session_key,
+//!     hops_path,
 //!     hops_data.clone(),
 //!     Some(assoc_data.clone()),
+//!     1300,
+//!     &secp,
 //! ).expect("new onion packet");
 //!
 //! // Hop 0
+//! # use fiber_sphinx::SphinxError;
 //! # {
 //! #     // error cases
 //! #     let res = packet.clone().peel(&hops_keys[0], None, &secp, get_length);
@@ -91,8 +93,11 @@ use thiserror::Error;
 const HMAC_KEY_RHO: &[u8] = b"rho";
 const HMAC_KEY_MU: &[u8] = b"mu";
 const HMAC_KEY_PAD: &[u8] = b"pad";
+const HMAC_KEY_UM: &[u8] = b"um";
+const HMAC_KEY_AMMAG: &[u8] = b"ammag";
 const CHACHA_NONCE: [u8; 12] = [0u8; 12];
 
+/// Onion packet to send encrypted message via multiple hops.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct OnionPacket {
     /// Version of the onion packet, currently 0
@@ -105,7 +110,80 @@ pub struct OnionPacket {
     pub hmac: [u8; 32],
 }
 
+/// Onion error packet to return errors to the origin node.
+///
+/// The nodes must store the shared secrets to forward `OnionPacket` locally and reuse them to obfuscate
+/// the error packet. See the section "Returning Errors" in the specification for details.
+///
+/// ## Example
+///
+/// ```rust
+/// use secp256k1::{PublicKey, SecretKey, Secp256k1};
+/// use std::str::FromStr;
+/// use fiber_sphinx::{OnionErrorPacket, OnionPacket, OnionSharedSecretIter};
+///
+/// let secp = Secp256k1::new();
+/// let hops_path = vec![
+///   PublicKey::from_str("02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619").expect("valid public key"),
+///   PublicKey::from_str("0324653eac434488002cc06bbfb7f10fe18991e35f9fe4302dbea6d2353dc0ab1c").expect("valid public key"),
+///   PublicKey::from_str("027f31ebc5462c1fdce1b737ecff52d37d75dea43ce11c74d25aa297165faa2007").expect("valid public key"),
+/// ];
+/// let session_key = SecretKey::from_slice(&[0x41; 32]).expect("32 bytes, within curve order");
+/// let hops_ss = OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp).collect::<Vec<_>>();
+///
+/// // The node [0x21; 32] generates the error
+/// let shared_secret = hops_ss[1];
+/// let error_packet = OnionErrorPacket::create(&shared_secret, b"error message".to_vec());
+/// ```
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct OnionErrorPacket {
+    /// Encrypted error-returning packet data.
+    pub packet_data: Vec<u8>,
+}
+
 impl OnionPacket {
+    /// Creates the new onion packet for the first hop.
+    ///
+    /// - `hops_path`: The public keys for each hop. These are _y_<sub>i</sub> in the specification.
+    /// - `session_key`: The ephemeral secret key for the onion packet. It must be generated securely using a random process.
+    ///     This is _x_ in the specification.
+    /// - `hops_data`: The unencrypted data for each hop. **Attention** that the data for each hop will be concatenated with
+    ///     the remaining encrypted data. To extract the data, the receiver must know the data length. For example, the hops
+    ///     data can include its length at the beginning. These are _m_<sub>i</sub> in the specification.
+    /// - `assoc_data`: The associated data. It will not be included in the packet itself but will be covered by the packet's
+    ///     HMAC. This allows each hop to verify that the associated data has not been tampered with. This is _A_ in the
+    ///     specification.
+    /// - `onion_packet_len`: The length of the onion packet. The packet has the same size for each hop.
+    pub fn create<C: Signing>(
+        session_key: SecretKey,
+        hops_path: Vec<PublicKey>,
+        hops_data: Vec<Vec<u8>>,
+        assoc_data: Option<Vec<u8>>,
+        packet_data_len: usize,
+        secp_ctx: &Secp256k1<C>,
+    ) -> Result<OnionPacket, SphinxError> {
+        if hops_path.len() != hops_data.len() {
+            return Err(SphinxError::HopsLenMismatch);
+        }
+        if hops_path.is_empty() {
+            return Err(SphinxError::HopsIsEmpty);
+        }
+
+        let hops_keys = derive_hops_forward_keys(&hops_path, session_key, secp_ctx);
+        let pad_key = derive_key(HMAC_KEY_PAD, &session_key.secret_bytes());
+        let packet_data = generate_padding_data(packet_data_len, &pad_key);
+        let filler = generate_filler(packet_data_len, &hops_keys, &hops_data)?;
+
+        construct_onion_packet(
+            packet_data,
+            session_key.public_key(secp_ctx),
+            &hops_keys,
+            &hops_data,
+            assoc_data,
+            filler,
+        )
+    }
+
     /// Converts the onion packet into a byte vector.
     pub fn into_bytes(self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(1 + 33 + self.packet_data.len() + 32);
@@ -114,6 +192,11 @@ impl OnionPacket {
         bytes.extend_from_slice(&self.packet_data);
         bytes.extend_from_slice(&self.hmac);
         bytes
+    }
+
+    /// Derives the shared secret using the node secret key and the ephemeral public key in the onion packet.
+    pub fn shared_secret(&self, secret_key: &SecretKey) -> [u8; 32] {
+        SharedSecret::new(&self.public_key, secret_key).secret_bytes()
     }
 
     /// Peels the onion packet at the current hop.
@@ -136,7 +219,7 @@ impl OnionPacket {
         F: FnOnce(&[u8]) -> Option<usize>,
     {
         let packet_data_len = self.packet_data.len();
-        let shared_secret = SharedSecret::new(&self.public_key, secret_key);
+        let shared_secret = self.shared_secret(secret_key);
         let rho = derive_key(HMAC_KEY_RHO, shared_secret.as_ref());
         let mu = derive_key(HMAC_KEY_MU, shared_secret.as_ref());
 
@@ -178,6 +261,89 @@ impl OnionPacket {
     }
 }
 
+impl OnionErrorPacket {
+    /// Creates an onion error packet using the erring node shared secret.
+    ///
+    /// The erring node should store the shared secrets to forward the onion packet locally and reuse them to obfuscate
+    /// the error packet.
+    ///
+    /// The shared secret can be obtained via `OnionPacket::shared_secret`.
+    pub fn create(shared_secret: &[u8; 32], mut payload: Vec<u8>) -> Self {
+        let ReturnKeys { ammag, um } = ReturnKeys::new(shared_secret);
+        let mut packet_data = compute_hmac(&um, &payload, None).to_vec();
+        packet_data.append(&mut payload);
+
+        (OnionErrorPacket { packet_data }).xor_cipher_stream_with_ammag(ammag)
+    }
+
+    fn xor_cipher_stream_with_ammag(self, ammag: [u8; 32]) -> Self {
+        let mut chacha = ChaCha20::new(&ammag.into(), &CHACHA_NONCE.into());
+        let mut packet_data = self.packet_data;
+        chacha.apply_keystream(&mut packet_data[..]);
+
+        Self { packet_data }
+    }
+
+    /// Encrypts or decrypts the packet data with the chacha20 stream.
+    ///
+    /// Apply XOR on the packet data with the keystream generated by the chacha20 stream cipher.
+    pub fn xor_cipher_stream(self, shared_secret: &[u8; 32]) -> Self {
+        let ammag = derive_ammag_key(shared_secret);
+        self.xor_cipher_stream_with_ammag(ammag)
+    }
+
+    /// Decrypts the packet data and parses the error message.
+    ///
+    /// This method is for the origin node to decrypts the packet data node by node and try to parse the message.
+    ///
+    /// - `hops_path`: The public keys for each hop. These are _y_<sub>i</sub> in the specification.
+    /// - `session_key`: The ephemeral secret key for the onion packet. It must be generated securely using a random process.
+    ///     This is _x_ in the specification.
+    /// - `parse_payload`: A function to parse the error payload from the decrypted packet data. It should return `Some(T)` if
+    ///     the given buffer starts with a valid error payload, otherwise `None`.
+    ///
+    /// Returns the parsed error message and the erring node public key if the HMAC is valid and the error message is successfully
+    /// parsed by the function `parse_payload`.
+    pub fn parse<F, T>(
+        self,
+        hops_path: Vec<PublicKey>,
+        session_key: SecretKey,
+        parse_payload: F,
+    ) -> Option<(T, PublicKey)>
+    where
+        F: Fn(&[u8]) -> Option<T>,
+    {
+        // The packet must contain the HMAC so it has to be at least 32 bytes
+        if self.packet_data.len() < 32 {
+            return None;
+        }
+
+        let secp_ctx = Secp256k1::new();
+        let mut packet = self;
+        for (public_key, shared_secret) in hops_path.iter().zip(OnionSharedSecretIter::new(
+            hops_path.iter(),
+            session_key,
+            &secp_ctx,
+        )) {
+            let ReturnKeys { ammag, um } = ReturnKeys::new(&shared_secret);
+            packet = packet.xor_cipher_stream_with_ammag(ammag);
+            if let Some(error) = parse_payload(&packet.packet_data[32..]) {
+                let hmac = compute_hmac(&um, &packet.packet_data[32..], None);
+                if hmac == packet.packet_data[..32] {
+                    return Some((error, public_key.clone()));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Converts the onion packet into a byte vector.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.packet_data
+    }
+}
+
 #[derive(Error, Debug, Eq, PartialEq)]
 pub enum SphinxError {
     #[error("The hops path does not match the hops data length")]
@@ -194,6 +360,127 @@ pub enum SphinxError {
 
     #[error("The parsed data len is larger than the onion packet len")]
     HopDataLenTooLarge,
+}
+
+/// Keys used to forward the onion packet.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ForwardKeys {
+    /// Key derived from the shared secret for the hop. It is used to encrypt the packet data.
+    pub rho: [u8; 32],
+    /// Key derived from the shared secret for the hop. It is used to compute the HMAC of the packet data.
+    pub mu: [u8; 32],
+}
+
+impl ForwardKeys {
+    /// Derive keys for forwarding the onion packet from the shared secret.
+    pub fn new(shared_secret: &[u8]) -> ForwardKeys {
+        ForwardKeys {
+            rho: derive_key(HMAC_KEY_RHO, shared_secret),
+            mu: derive_key(HMAC_KEY_MU, shared_secret),
+        }
+    }
+}
+
+/// Keys used to return the error packet.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ReturnKeys {
+    /// Key derived from the shared secret for the hop. It is used to encrypt the error packet data.
+    pub ammag: [u8; 32],
+    /// Key derived from the shared secret for the hop. It is used to compute the HMAC of the error packet data.
+    pub um: [u8; 32],
+}
+
+impl ReturnKeys {
+    /// Derive keys for returning the error onion packet from the shared secret.
+    pub fn new(shared_secret: &[u8]) -> ReturnKeys {
+        ReturnKeys {
+            ammag: derive_ammag_key(shared_secret),
+            um: derive_key(HMAC_KEY_UM, shared_secret),
+        }
+    }
+}
+
+#[inline]
+pub fn derive_ammag_key(shared_secret: &[u8]) -> [u8; 32] {
+    derive_key(HMAC_KEY_AMMAG, shared_secret)
+}
+
+/// Shared secrets generator.
+///
+/// ## Example
+///
+/// ```rust
+/// use secp256k1::{PublicKey, SecretKey, Secp256k1};
+/// use fiber_sphinx::{OnionSharedSecretIter};
+///
+/// let secp = Secp256k1::new();
+/// let hops_keys = vec![
+///     SecretKey::from_slice(&[0x20; 32]).expect("32 bytes, within curve order"),
+///     SecretKey::from_slice(&[0x21; 32]).expect("32 bytes, within curve order"),
+///     SecretKey::from_slice(&[0x22; 32]).expect("32 bytes, within curve order"),
+/// ];
+/// let hops_path: Vec<_> = hops_keys.iter().map(|sk| sk.public_key(&secp)).collect();
+/// let session_key = SecretKey::from_slice(&[0x41; 32]).expect("32 bytes, within curve order");
+/// // Gets shared secrets for each hop
+/// let hops_ss: Vec<_> = OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp).collect();
+/// ```
+#[derive(Clone)]
+pub struct OnionSharedSecretIter<'s, I, C: Signing> {
+    /// A list of node public keys
+    hops_path_iter: I,
+    ephemeral_secret_key: SecretKey,
+    secp_ctx: &'s Secp256k1<C>,
+}
+
+impl<'s, I, C: Signing> OnionSharedSecretIter<'s, I, C> {
+    /// Creates an iterator to generate shared secrets for each hop.
+    ///
+    /// - `hops_path`: The public keys for each hop. These are _y_<sub>i</sub> in the specification.
+    /// - `session_key`: The ephemeral secret key for the onion packet. It must be generated securely using a random process.
+    ///     This is _x_ in the specification.
+    pub fn new(
+        hops_path_iter: I,
+        session_key: SecretKey,
+        secp_ctx: &'s Secp256k1<C>,
+    ) -> OnionSharedSecretIter<I, C> {
+        OnionSharedSecretIter {
+            hops_path_iter,
+            secp_ctx,
+            ephemeral_secret_key: session_key,
+        }
+    }
+}
+
+impl<'s, 'i, I: Iterator<Item = &'i PublicKey>, C: Signing> Iterator
+    for OnionSharedSecretIter<'s, I, C>
+{
+    type Item = [u8; 32];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.hops_path_iter.next().map(|pk| {
+            let shared_secret = SharedSecret::new(&pk, &self.ephemeral_secret_key);
+
+            let ephemeral_public_key = self.ephemeral_secret_key.public_key(self.secp_ctx);
+            self.ephemeral_secret_key = derive_next_hop_ephemeral_secret_key(
+                self.ephemeral_secret_key,
+                &ephemeral_public_key,
+                shared_secret.as_ref(),
+            );
+
+            shared_secret.secret_bytes()
+        })
+    }
+}
+
+/// Derives keys for forwarding the onion packet.
+fn derive_hops_forward_keys<C: Signing>(
+    hops_path: &Vec<PublicKey>,
+    session_key: SecretKey,
+    secp_ctx: &Secp256k1<C>,
+) -> Vec<ForwardKeys> {
+    OnionSharedSecretIter::new(hops_path.iter(), session_key, secp_ctx)
+        .map(|shared_secret| ForwardKeys::new(&shared_secret))
+        .collect()
 }
 
 #[inline]
@@ -217,9 +504,9 @@ fn shift_slice_left(arr: &mut [u8], amt: usize) {
     }
 }
 
-/// Computes hmac of packet_data and optional associated data using the key `mu`.
-fn compute_hmac(mu: &[u8; 32], packet_data: &[u8], assoc_data: Option<&[u8]>) -> [u8; 32] {
-    let mut hmac_engine = Hmac::<Sha256>::new_from_slice(mu).expect("valid hmac key");
+/// Computes hmac of packet_data and optional associated data using the key `hmac_key`.
+fn compute_hmac(hmac_key: &[u8; 32], packet_data: &[u8], assoc_data: Option<&[u8]>) -> [u8; 32] {
+    let mut hmac_engine = Hmac::<Sha256>::new_from_slice(hmac_key).expect("valid hmac key");
     hmac_engine.update(&packet_data);
     if let Some(ref assoc_data) = assoc_data {
         hmac_engine.update(assoc_data);
@@ -288,46 +575,6 @@ fn derive_next_hop_ephemeral_public_key<C: Verification>(
         .expect("valid mul tweak")
 }
 
-// Keys manager for each hop
-struct HopKeys {
-    /// Ephemeral public key for the hop. The _alpha_ in the specification.
-    ephemeral_public_key: PublicKey,
-    /// Key derived from the shared secret for the hop. It is used to encrypt the packet data.
-    rho: [u8; 32],
-    /// Key derived from the shared secret for the hop. It is used to compute the HMAC of the packet data.
-    mu: [u8; 32],
-}
-
-/// Derives HopKeys for each hop.
-fn derive_hops_keys<C: Signing>(
-    hops_path: &Vec<PublicKey>,
-    session_key: SecretKey,
-    secp_ctx: &Secp256k1<C>,
-) -> Vec<HopKeys> {
-    hops_path
-        .iter()
-        .scan(session_key, |ephemeral_secret_key, pk| {
-            let ephemeral_public_key = ephemeral_secret_key.public_key(secp_ctx);
-
-            let shared_secret = SharedSecret::new(pk, ephemeral_secret_key);
-            let rho = derive_key(HMAC_KEY_RHO, shared_secret.as_ref());
-            let mu = derive_key(HMAC_KEY_MU, shared_secret.as_ref());
-
-            *ephemeral_secret_key = derive_next_hop_ephemeral_secret_key(
-                *ephemeral_secret_key,
-                &ephemeral_public_key,
-                shared_secret.as_ref(),
-            );
-
-            Some(HopKeys {
-                ephemeral_public_key,
-                rho,
-                mu,
-            })
-        })
-        .collect()
-}
-
 /// Derives a key from the shared secret using HMAC.
 fn derive_key(hmac_key: &[u8], shared_secret: &[u8]) -> [u8; 32] {
     let mut mac = Hmac::<Sha256>::new_from_slice(hmac_key).expect("valid hmac key");
@@ -348,7 +595,7 @@ fn generate_padding_data(packet_data_len: usize, pad_key: &[u8]) -> Vec<u8> {
 /// Generates the filler to obfuscate the onion packet.
 fn generate_filler(
     packet_data_len: usize,
-    hops_keys: &[HopKeys],
+    hops_keys: &[ForwardKeys],
     hops_data: &[Vec<u8>],
 ) -> Result<Vec<u8>, SphinxError> {
     let mut filler = Vec::new();
@@ -378,14 +625,16 @@ fn generate_filler(
 /// Constructs the onion packet internally.
 ///
 /// - `packet_data`: The initial 1300 bytes of the onion packet generated by `generate_padding_data`.
-/// - `hops_keys`: The keys for each hop generated by `derive_hops_keys`.
+/// - `public_key`: The ephemeral public key for the first hop.
+/// - `hops_keys`: The keys for each hop generated by `derive_hops_forward_keys`.
 /// - `hops_data`: The unencrypted data for each hop.
 /// - `assoc_data`: The associated data. It will not be included in the packet itself but will be covered by the packet's
 ///     HMAC. This allows each hop to verify that the associated data has not been tampered with.
 /// - `filler`: The filler to obfuscate the packet data, which is generated by `generate_filler`.
 fn construct_onion_packet(
     mut packet_data: Vec<u8>,
-    hops_keys: &[HopKeys],
+    public_key: PublicKey,
+    hops_keys: &[ForwardKeys],
     hops_data: &[Vec<u8>],
     assoc_data: Option<Vec<u8>>,
     filler: Vec<u8>,
@@ -414,50 +663,17 @@ fn construct_onion_packet(
 
     Ok(OnionPacket {
         version: 0,
-        public_key: hops_keys.first().unwrap().ephemeral_public_key,
+        public_key,
         packet_data,
         hmac,
     })
-}
-
-/// Creates a new onion packet internally.
-///
-/// - `onion_packet_len`: The length of the onion packet. The packet has the same size for each hop.
-/// - `hops_path`: The public keys for each hop. These are _y_<sub>i</sub> in the specification.
-/// - `session_key`: The ephemeral secret key for the onion packet. It must be generated securely using a random process.
-///     This is _x_ in the specification.
-/// - `hops_data`: The unencrypted data for each hop. **Attention** that the data for each hop will be concatenated with
-///     the remaining encrypted data. To extract the data, the receiver must know the data length. For example, the hops
-///     data can include its length at the beginning. These are _m_<sub>i</sub> in the specification.
-/// - `assoc_data`: The associated data. It will not be included in the packet itself but will be covered by the packet's
-///     HMAC. This allows each hop to verify that the associated data has not been tampered with. This is _A_ in the
-///     specification.
-pub fn new_onion_packet(
-    packet_data_len: usize,
-    hops_path: Vec<PublicKey>,
-    session_key: SecretKey,
-    hops_data: Vec<Vec<u8>>,
-    assoc_data: Option<Vec<u8>>,
-) -> Result<OnionPacket, SphinxError> {
-    if hops_path.len() != hops_data.len() {
-        return Err(SphinxError::HopsLenMismatch);
-    }
-    if hops_path.is_empty() {
-        return Err(SphinxError::HopsIsEmpty);
-    }
-
-    let hops_keys = derive_hops_keys(&hops_path, session_key, &Secp256k1::new());
-    let pad_key = derive_key(HMAC_KEY_PAD, &session_key.secret_bytes());
-    let packet_data = generate_padding_data(packet_data_len, &pad_key);
-    let filler = generate_filler(packet_data_len, &hops_keys, &hops_data)?;
-
-    construct_onion_packet(packet_data, &hops_keys, &hops_data, assoc_data, filler)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use hex_conservative::prelude::*;
+    use std::str::FromStr;
     const PACKET_DATA_LEN: usize = 1300;
 
     fn get_test_session_key() -> SecretKey {
@@ -466,14 +682,14 @@ mod tests {
 
     fn get_test_hops_path() -> Vec<PublicKey> {
         vec![
-            Vec::from_hex("02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619"),
-            Vec::from_hex("0324653eac434488002cc06bbfb7f10fe18991e35f9fe4302dbea6d2353dc0ab1c"),
-            Vec::from_hex("027f31ebc5462c1fdce1b737ecff52d37d75dea43ce11c74d25aa297165faa2007"),
-            Vec::from_hex("032c0b7cf95324a07d05398b240174dc0c2be444d96b159aa6c7f7b1e668680991"),
-            Vec::from_hex("02edabbd16b41c8371b92ef2f04c1185b4f03b6dcd52ba9b78d9d7c89c8f221145"),
+            "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619",
+            "0324653eac434488002cc06bbfb7f10fe18991e35f9fe4302dbea6d2353dc0ab1c",
+            "027f31ebc5462c1fdce1b737ecff52d37d75dea43ce11c74d25aa297165faa2007",
+            "032c0b7cf95324a07d05398b240174dc0c2be444d96b159aa6c7f7b1e668680991",
+            "02edabbd16b41c8371b92ef2f04c1185b4f03b6dcd52ba9b78d9d7c89c8f221145",
         ]
         .into_iter()
-        .map(|pk| PublicKey::from_slice(&pk.unwrap()).expect("33 bytes, valid pubkey"))
+        .map(|pk| PublicKey::from_str(pk).expect("33 bytes, valid pubkey"))
         .collect()
     }
 
@@ -491,18 +707,11 @@ mod tests {
     fn test_derive_hops_keys() {
         let hops_path = get_test_hops_path();
         let session_key = get_test_session_key();
-        let hops_keys = derive_hops_keys(&hops_path, session_key, &Secp256k1::new());
+        let hops_keys = derive_hops_forward_keys(&hops_path, session_key, &Secp256k1::new());
 
         assert_eq!(hops_keys.len(), 5);
 
         // hop 0
-        assert_eq!(
-            hops_keys[0]
-                .ephemeral_public_key
-                .serialize()
-                .to_lower_hex_string(),
-            "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619",
-        );
         assert_eq!(
             hops_keys[0].rho.to_lower_hex_string(),
             "ce496ec94def95aadd4bec15cdb41a740c9f2b62347c4917325fcc6fb0453986",
@@ -514,13 +723,6 @@ mod tests {
 
         // hop 1
         assert_eq!(
-            hops_keys[1]
-                .ephemeral_public_key
-                .serialize()
-                .to_lower_hex_string(),
-            "028f9438bfbf7feac2e108d677e3a82da596be706cc1cf342b75c7b7e22bf4e6e2",
-        );
-        assert_eq!(
             hops_keys[1].rho.to_lower_hex_string(),
             "450ffcabc6449094918ebe13d4f03e433d20a3d28a768203337bc40b6e4b2c59",
         );
@@ -530,13 +732,6 @@ mod tests {
         );
 
         // hop 2
-        assert_eq!(
-            hops_keys[2]
-                .ephemeral_public_key
-                .serialize()
-                .to_lower_hex_string(),
-            "03bfd8225241ea71cd0843db7709f4c222f62ff2d4516fd38b39914ab6b83e0da0",
-        );
         assert_eq!(
             hops_keys[2].rho.to_lower_hex_string(),
             "11bf5c4f960239cb37833936aa3d02cea82c0f39fd35f566109c41f9eac8deea",
@@ -548,13 +743,6 @@ mod tests {
 
         // hop 3
         assert_eq!(
-            hops_keys[3]
-                .ephemeral_public_key
-                .serialize()
-                .to_lower_hex_string(),
-            "031dde6926381289671300239ea8e57ffaf9bebd05b9a5b95beaf07af05cd43595",
-        );
-        assert_eq!(
             hops_keys[3].rho.to_lower_hex_string(),
             "cbe784ab745c13ff5cffc2fbe3e84424aa0fd669b8ead4ee562901a4a4e89e9e",
         );
@@ -564,13 +752,6 @@ mod tests {
         );
 
         // hop 4
-        assert_eq!(
-            hops_keys[4]
-                .ephemeral_public_key
-                .serialize()
-                .to_lower_hex_string(),
-            "03a214ebd875aab6ddfd77f22c5e7311d7f77f17a169e599f157bbcdae8bf071f4",
-        );
         assert_eq!(
             hops_keys[4].rho.to_lower_hex_string(),
             "034e18b8cc718e8af6339106e706c52d8df89e2b1f7e9142d996acf88df8799b",
@@ -606,7 +787,7 @@ mod tests {
     fn test_generate_filler() {
         let hops_path = get_test_hops_path();
         let session_key = get_test_session_key();
-        let hops_keys = derive_hops_keys(&hops_path, session_key, &Secp256k1::new());
+        let hops_keys = derive_hops_forward_keys(&hops_path, session_key, &Secp256k1::new());
         let hops_data = get_test_hops_data();
 
         let filler = generate_filler(PACKET_DATA_LEN, &hops_keys, &hops_data);
@@ -616,7 +797,8 @@ mod tests {
     }
 
     #[test]
-    fn test_new_onion_packet() {
+    fn test_create_onion_packet() {
+        let secp = Secp256k1::new();
         let hops_path = get_test_hops_path();
         let session_key = get_test_session_key();
         let hops_data = vec![
@@ -628,12 +810,13 @@ mod tests {
         ];
         let assoc_data = vec![0x42u8; 32];
 
-        let packet = new_onion_packet(
-            PACKET_DATA_LEN,
-            hops_path,
+        let packet = OnionPacket::create(
             session_key,
+            hops_path,
             hops_data,
             Some(assoc_data),
+            PACKET_DATA_LEN,
+            &secp,
         )
         .unwrap();
         let packet_bytes = packet.into_bytes();
@@ -657,12 +840,13 @@ mod tests {
         let get_length = |packet_data: &[u8]| Some(packet_data[0] as usize + 1);
         let assoc_data = vec![0x42u8; 32];
 
-        let packet = new_onion_packet(
-            2000,
-            hops_path,
+        let packet = OnionPacket::create(
             session_key,
+            hops_path,
             hops_data.clone(),
             Some(assoc_data.clone()),
+            2000,
+            &secp,
         )
         .expect("new onion packet");
 
@@ -712,5 +896,117 @@ mod tests {
         assert!(res.is_ok());
         let (data, _packet) = res.unwrap();
         assert_eq!(data, hops_data[2]);
+    }
+
+    #[test]
+    fn test_create_onion_error_packet() {
+        let secp = Secp256k1::new();
+        let hops_path = get_test_hops_path();
+        let session_key = get_test_session_key();
+        let hops_ss: Vec<_> =
+            OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp).collect();
+        let error_payload = <Vec<u8>>::from_hex("0002200200fe0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000").expect("valid hex");
+
+        let onion_packet_1 = OnionErrorPacket::create(&hops_ss[4], error_payload);
+        let expected_hex = "a5e6bd0c74cb347f10cce367f949098f2457d14c046fd8a22cb96efb30b0fdcda8cb9168b50f2fd45edd73c1b0c8b33002df376801ff58aaa94000bf8a86f92620f343baef38a580102395ae3abf9128d1047a0736ff9b83d456740ebbb4aeb3aa9737f18fb4afb4aa074fb26c4d702f42968888550a3bded8c05247e045b866baef0499f079fdaeef6538f31d44deafffdfd3afa2fb4ca9082b8f1c465371a9894dd8c243fb4847e004f5256b3e90e2edde4c9fb3082ddfe4d1e734cacd96ef0706bf63c9984e22dc98851bcccd1c3494351feb458c9c6af41c0044bea3c47552b1d992ae542b17a2d0bba1a096c78d169034ecb55b6e3a7263c26017f033031228833c1daefc0dedb8cf7c3e37c9c37ebfe42f3225c326e8bcfd338804c145b16e34e4";
+        assert_eq!(
+            onion_packet_1.clone().into_bytes().to_lower_hex_string(),
+            expected_hex
+        );
+
+        let onion_packet_2 = onion_packet_1.xor_cipher_stream(&hops_ss[3]);
+        let expected_hex = "c49a1ce81680f78f5f2000cda36268de34a3f0a0662f55b4e837c83a8773c22aa081bab1616a0011585323930fa5b9fae0c85770a2279ff59ec427ad1bbff9001c0cd1497004bd2a0f68b50704cf6d6a4bf3c8b6a0833399a24b3456961ba00736785112594f65b6b2d44d9f5ea4e49b5e1ec2af978cbe31c67114440ac51a62081df0ed46d4a3df295da0b0fe25c0115019f03f15ec86fabb4c852f83449e812f141a9395b3f70b766ebbd4ec2fae2b6955bd8f32684c15abfe8fd3a6261e52650e8807a92158d9f1463261a925e4bfba44bd20b166d532f0017185c3a6ac7957adefe45559e3072c8dc35abeba835a8cb01a71a15c736911126f27d46a36168ca5ef7dccd4e2886212602b181463e0dd30185c96348f9743a02aca8ec27c0b90dca270";
+        assert_eq!(
+            onion_packet_2.clone().into_bytes().to_lower_hex_string(),
+            expected_hex
+        );
+
+        let onion_packet_3 = onion_packet_2.xor_cipher_stream(&hops_ss[2]);
+        let expected_hex = "a5d3e8634cfe78b2307d87c6d90be6fe7855b4f2cc9b1dfb19e92e4b79103f61ff9ac25f412ddfb7466e74f81b3e545563cdd8f5524dae873de61d7bdfccd496af2584930d2b566b4f8d3881f8c043df92224f38cf094cfc09d92655989531524593ec6d6caec1863bdfaa79229b5020acc034cd6deeea1021c50586947b9b8e6faa83b81fbfa6133c0af5d6b07c017f7158fa94f0d206baf12dda6b68f785b773b360fd0497e16cc402d779c8d48d0fa6315536ef0660f3f4e1865f5b38ea49c7da4fd959de4e83ff3ab686f059a45c65ba2af4a6a79166aa0f496bf04d06987b6d2ea205bdb0d347718b9aeff5b61dfff344993a275b79717cd815b6ad4c0beb568c4ac9c36ff1c315ec1119a1993c4b61e6eaa0375e0aaf738ac691abd3263bf937e3";
+        assert_eq!(
+            onion_packet_3.clone().into_bytes().to_lower_hex_string(),
+            expected_hex
+        );
+
+        let onion_packet_4 = onion_packet_3.xor_cipher_stream(&hops_ss[1]);
+        let expected_hex = "aac3200c4968f56b21f53e5e374e3a2383ad2b1b6501bbcc45abc31e59b26881b7dfadbb56ec8dae8857add94e6702fb4c3a4de22e2e669e1ed926b04447fc73034bb730f4932acd62727b75348a648a1128744657ca6a4e713b9b646c3ca66cac02cdab44dd3439890ef3aaf61708714f7375349b8da541b2548d452d84de7084bb95b3ac2345201d624d31f4d52078aa0fa05a88b4e20202bd2b86ac5b52919ea305a8949de95e935eed0319cf3cf19ebea61d76ba92532497fcdc9411d06bcd4275094d0a4a3c5d3a945e43305a5a9256e333e1f64dbca5fcd4e03a39b9012d197506e06f29339dfee3331995b21615337ae060233d39befea925cc262873e0530408e6990f1cbd233a150ef7b004ff6166c70c68d9f8c853c1abca640b8660db2921";
+        assert_eq!(
+            onion_packet_4.clone().into_bytes().to_lower_hex_string(),
+            expected_hex
+        );
+
+        let onion_packet_5 = onion_packet_4.xor_cipher_stream(&hops_ss[0]);
+        let expected_hex = "9c5add3963fc7f6ed7f148623c84134b5647e1306419dbe2174e523fa9e2fbed3a06a19f899145610741c83ad40b7712aefaddec8c6baf7325d92ea4ca4d1df8bce517f7e54554608bf2bd8071a4f52a7a2f7ffbb1413edad81eeea5785aa9d990f2865dc23b4bc3c301a94eec4eabebca66be5cf638f693ec256aec514620cc28ee4a94bd9565bc4d4962b9d3641d4278fb319ed2b84de5b665f307a2db0f7fbb757366067d88c50f7e829138fde4f78d39b5b5802f1b92a8a820865af5cc79f9f30bc3f461c66af95d13e5e1f0381c184572a91dee1c849048a647a1158cf884064deddbf1b0b88dfe2f791428d0ba0f6fb2f04e14081f69165ae66d9297c118f0907705c9c4954a199bae0bb96fad763d690e7daa6cfda59ba7f2c8d11448b604d12d";
+        assert_eq!(
+            onion_packet_5.into_bytes().to_lower_hex_string(),
+            expected_hex
+        );
+    }
+
+    fn parse_lightning_error_packet_data(payload: &[u8]) -> Option<Vec<u8>> {
+        (payload.len() >= 2).then_some(())?;
+        let message_len = u16::from_be_bytes(payload[0..2].try_into().unwrap()) as usize;
+
+        (payload.len() >= message_len + 4).then_some(())?;
+        let pad_len = u16::from_be_bytes(
+            payload[(message_len + 2)..(message_len + 4)]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+
+        (payload.len() == message_len + pad_len + 4).then(|| payload[2..(2 + message_len)].to_vec())
+    }
+
+    #[test]
+    fn test_parse_onion_error_packet() {
+        let secp = Secp256k1::new();
+        let hops_path = get_test_hops_path();
+        let session_key = get_test_session_key();
+        let hops_ss: Vec<_> =
+            OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp).collect();
+        let error_payload = <Vec<u8>>::from_hex("0002200200fe0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000").expect("valid hex");
+
+        {
+            // from the first hop
+            let packet = OnionErrorPacket::create(&hops_ss[0], error_payload.clone());
+            let error = packet.parse(
+                hops_path.clone(),
+                session_key,
+                parse_lightning_error_packet_data,
+            );
+            assert!(error.is_some());
+            let (error, public_key) = error.unwrap();
+            assert_eq!(error, vec![0x20, 0x02]);
+            assert_eq!(public_key, hops_path[0]);
+        }
+
+        {
+            // from the last hop
+            let packet = OnionErrorPacket::create(&hops_ss[4], error_payload.clone())
+                .xor_cipher_stream(&hops_ss[3])
+                .xor_cipher_stream(&hops_ss[2])
+                .xor_cipher_stream(&hops_ss[1])
+                .xor_cipher_stream(&hops_ss[0]);
+            let error = packet.parse(
+                hops_path.clone(),
+                session_key,
+                parse_lightning_error_packet_data,
+            );
+            assert!(error.is_some());
+            let (error, public_key) = error.unwrap();
+            assert_eq!(error, vec![0x20, 0x02]);
+            assert_eq!(public_key, hops_path[4]);
+        }
+
+        {
+            // invalid packet.  The packet should be encrypted by the first hop but not.
+            let packet = OnionErrorPacket::create(&hops_ss[1], error_payload.clone());
+            let error = packet.parse(
+                hops_path.clone(),
+                session_key,
+                parse_lightning_error_packet_data,
+            );
+            assert!(error.is_none());
+        }
     }
 }
