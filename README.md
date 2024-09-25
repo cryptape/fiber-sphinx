@@ -2,6 +2,7 @@
 
 A Rust implementation of [Sphinx][] (a.k.a. Onion Message) for [Fiber][].
 
+- [Specification](docs/spec.md)
 - [Contributing Guidelines](docs/CONTRIBUTING.md)
 - [Development](docs/development.md)
 
