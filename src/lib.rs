@@ -194,6 +194,26 @@ impl OnionPacket {
         bytes
     }
 
+    /// Converts back from a byte vector.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, SphinxError> {
+        if bytes.len() < 66 {
+            return Err(SphinxError::PacketDataLenTooSmall);
+        }
+        let version = bytes[0];
+        let public_key =
+            PublicKey::from_slice(&bytes[1..34]).map_err(|_| SphinxError::PublicKeyInvalid)?;
+        let packet_data = (&bytes[34..(bytes.len() - 32)]).into();
+        let mut hmac = [0u8; 32];
+        hmac.copy_from_slice(&bytes[(bytes.len() - 32)..]);
+
+        Ok(Self {
+            version,
+            public_key,
+            packet_data,
+            hmac,
+        })
+    }
+
     /// Derives the shared secret using the node secret key and the ephemeral public key in the onion packet.
     pub fn shared_secret(&self, secret_key: &SecretKey) -> [u8; 32] {
         SharedSecret::new(&self.public_key, secret_key).secret_bytes()
@@ -342,6 +362,10 @@ impl OnionErrorPacket {
     pub fn into_bytes(self) -> Vec<u8> {
         self.packet_data
     }
+
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self { packet_data: bytes }
+    }
 }
 
 #[derive(Error, Debug, Eq, PartialEq)]
@@ -360,6 +384,12 @@ pub enum SphinxError {
 
     #[error("The parsed data len is larger than the onion packet len")]
     HopDataLenTooLarge,
+
+    #[error("The parsed data len is too small")]
+    PacketDataLenTooSmall,
+
+    #[error("Invalid public key")]
+    PublicKeyInvalid,
 }
 
 /// Keys used to forward the onion packet.
@@ -701,6 +731,26 @@ mod tests {
             Vec::from_hex("1202022710040203e806080000000000000004").unwrap(),
             Vec::from_hex("fd011002022710040203e8082224a33562c54507a9334e79f0dc4f17d407e6d7c61f0e2f3d0d38599502f617042710fd012de02a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a").unwrap(),
         ]
+    }
+
+    #[test]
+    fn test_onion_packet_from_bytes() {
+        let public_key = PublicKey::from_slice(
+            Vec::from_hex("02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619")
+                .expect("valid hex")
+                .as_ref(),
+        )
+        .expect("valid public key");
+        let packet = OnionPacket {
+            version: 1,
+            public_key,
+            packet_data: vec![2],
+            hmac: [3; 32],
+        };
+        let packet_from_bytes_res = OnionPacket::from_bytes(packet.clone().into_bytes());
+        assert!(packet_from_bytes_res.is_ok());
+        let packet_from_bytes = packet_from_bytes_res.unwrap();
+        assert_eq!(packet_from_bytes, packet);
     }
 
     #[test]
