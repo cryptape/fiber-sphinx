@@ -131,7 +131,7 @@ pub struct OnionPacket {
 /// let session_key = SecretKey::from_slice(&[0x41; 32]).expect("32 bytes, within curve order");
 /// let hops_ss = OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp).collect::<Vec<_>>();
 ///
-/// // The node [0x21; 32] generates the error
+/// // The node 0324653...0ab1c generates the error
 /// let shared_secret = hops_ss[1];
 /// let error_packet = OnionErrorPacket::create(&shared_secret, b"error message".to_vec());
 /// ```
