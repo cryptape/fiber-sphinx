@@ -5,10 +5,11 @@ on:
     branches: [main, develop]
   pull_request:
     types: [opened, synchronize]
+  merge_group: {}
 
 jobs:
   matrix:
-    name: Build and Test
+    name: Build and Test Matrix
     timeout-minutes: 15
     runs-on: ubuntu-latest
 
