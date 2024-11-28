@@ -322,14 +322,14 @@ impl OnionErrorPacket {
     /// - `parse_payload`: A function to parse the error payload from the decrypted packet data. It should return `Some(T)` if
     ///     the given buffer starts with a valid error payload, otherwise `None`.
     ///
-    /// Returns the parsed error message and the erring node public key if the HMAC is valid and the error message is successfully
-    /// parsed by the function `parse_payload`.
+    /// Returns the parsed error message and the erring node index in `hops_path` if the HMAC is valid and the error message is
+    /// successfully parsed by the function `parse_payload`.
     pub fn parse<F, T>(
         self,
         hops_path: Vec<PublicKey>,
         session_key: SecretKey,
         parse_payload: F,
-    ) -> Option<(T, PublicKey)>
+    ) -> Option<(T, usize)>
     where
         F: Fn(&[u8]) -> Option<T>,
     {
@@ -340,17 +340,15 @@ impl OnionErrorPacket {
 
         let secp_ctx = Secp256k1::new();
         let mut packet = self;
-        for (public_key, shared_secret) in hops_path.iter().zip(OnionSharedSecretIter::new(
-            hops_path.iter(),
-            session_key,
-            &secp_ctx,
-        )) {
+        for (index, shared_secret) in
+            OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp_ctx).enumerate()
+        {
             let ReturnKeys { ammag, um } = ReturnKeys::new(&shared_secret);
             packet = packet.xor_cipher_stream_with_ammag(ammag);
             if let Some(error) = parse_payload(&packet.packet_data[32..]) {
                 let hmac = compute_hmac(&um, &packet.packet_data[32..], None);
                 if hmac == packet.packet_data[..32] {
-                    return Some((error, public_key.clone()));
+                    return Some((error, index));
                 }
             }
         }
@@ -1025,9 +1023,9 @@ mod tests {
                 parse_lightning_error_packet_data,
             );
             assert!(error.is_some());
-            let (error, public_key) = error.unwrap();
+            let (error, hops_index) = error.unwrap();
             assert_eq!(error, vec![0x20, 0x02]);
-            assert_eq!(public_key, hops_path[0]);
+            assert_eq!(hops_index, 0);
         }
 
         {
@@ -1043,9 +1041,9 @@ mod tests {
                 parse_lightning_error_packet_data,
             );
             assert!(error.is_some());
-            let (error, public_key) = error.unwrap();
+            let (error, hops_index) = error.unwrap();
             assert_eq!(error, vec![0x20, 0x02]);
-            assert_eq!(public_key, hops_path[4]);
+            assert_eq!(hops_index, 4);
         }
 
         {
