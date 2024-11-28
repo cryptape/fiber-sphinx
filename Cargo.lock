@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "fiber-sphinx"
-version = "1.0.1"
+version = "2.0.0"
 dependencies = [
  "chacha20",
  "hex-conservative",
