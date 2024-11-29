@@ -288,12 +288,17 @@ impl OnionErrorPacket {
     /// the error packet.
     ///
     /// The shared secret can be obtained via `OnionPacket::shared_secret`.
-    pub fn create(shared_secret: &[u8; 32], mut payload: Vec<u8>) -> Self {
+    pub fn create(shared_secret: &[u8; 32], payload: Vec<u8>) -> Self {
         let ReturnKeys { ammag, um } = ReturnKeys::new(shared_secret);
-        let mut packet_data = compute_hmac(&um, &payload, None).to_vec();
-        packet_data.append(&mut payload);
+        let hmac = compute_hmac(&um, &payload, None);
+        Self::concat(hmac, payload).xor_cipher_stream_with_ammag(ammag)
+    }
 
-        (OnionErrorPacket { packet_data }).xor_cipher_stream_with_ammag(ammag)
+    /// Concatenates HMAC and the payload without encryption.
+    pub fn concat(hmac: [u8; 32], mut payload: Vec<u8>) -> Self {
+        let mut packet_data = hmac.to_vec();
+        packet_data.append(&mut payload);
+        OnionErrorPacket { packet_data }
     }
 
     fn xor_cipher_stream_with_ammag(self, ammag: [u8; 32]) -> Self {
@@ -354,6 +359,19 @@ impl OnionErrorPacket {
         }
 
         None
+    }
+
+    /// Splits into HMAC and payload without decryption.
+    pub fn split(self) -> ([u8; 32], Vec<u8>) {
+        let mut hmac = [0u8; 32];
+        if self.packet_data.len() >= 32 {
+            hmac.copy_from_slice(&self.packet_data[..32]);
+            let payload = self.packet_data[32..].to_vec();
+            (hmac, payload)
+        } else {
+            hmac.copy_from_slice(&self.packet_data[..]);
+            (hmac, Vec::new())
+        }
     }
 
     /// Converts the onion packet into a byte vector.
@@ -1056,5 +1074,16 @@ mod tests {
             );
             assert!(error.is_none());
         }
+    }
+
+    #[test]
+    fn test_onion_error_packet_concat_split() {
+        let expected_hmac = [0x11; 32];
+        let expected_payload = vec![0x22];
+        let packet = OnionErrorPacket::concat(expected_hmac.clone(), expected_payload.clone());
+        let (hmac, payload) = packet.split();
+
+        assert_eq!(hmac, expected_hmac);
+        assert_eq!(payload, expected_payload);
     }
 }
