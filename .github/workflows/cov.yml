@@ -1,0 +1,53 @@
+name: Coverage
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  unit-tests-coverage:
+    name: Unit Tests Coverage
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions-rs/toolchain@v1
+      with:
+        toolchain: nightly
+        override: true
+    - name: Install deps
+      run: |
+        rustup component add llvm-tools-preview
+        grcov --version || cargo install --locked grcov
+    - name: Run tests
+      run: |
+        rm -rf target/coverage
+        mkdir -p target/coverage
+        cargo test --verbose
+      env:
+        CARGO_INCREMENTAL: '0'
+        RUSTFLAGS: '-Cinstrument-coverage'
+        RUSTDOCFLAGS: '-Cinstrument-coverage'
+        LLVM_PROFILE_FILE: 'target/coverage/unittests-%p-%m.profraw'
+    - name: Collect Report
+      run: |
+        grcov target/coverage --binary-path "target/debug/" \
+          -s src -t lcov --branch --ignore-not-existing \
+          --ignore "*/tests/*" \
+          --ignore "*/tests.rs" \
+          -o coverage-report.info
+    - name: Codecov
+      uses: codecov/codecov-action@v5
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      with:
+        # Repository upload token - get it from codecov.io. Required only for private repositories
+        # token: # optional
+        # Specify whether the Codecov output should be verbose
+        verbose: true
+        fail_ci_if_error: true
