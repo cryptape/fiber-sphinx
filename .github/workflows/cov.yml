@@ -37,9 +37,8 @@ jobs:
     - name: Collect Report
       run: |
         grcov target/coverage --binary-path "target/debug/" \
-          -s src -t lcov --branch --ignore-not-existing \
-          --ignore "*/tests/*" \
-          --ignore "*/tests.rs" \
+          -s . -t lcov --branch --ignore-not-existing \
+          --ignore "src/tests.rs" \
           -o coverage-report.info
     - name: Codecov
       uses: codecov/codecov-action@v5
