@@ -266,7 +266,7 @@ impl OnionPacket {
         if data_len > packet_data_len {
             return Err(SphinxError::HopDataLenTooLarge);
         }
-        let hop_data = (&packet_data[0..data_len]).to_vec();
+        let hop_data = packet_data[0..data_len].to_vec();
         let mut hmac = [0; 32];
         hmac.copy_from_slice(&packet_data[data_len..(data_len + 32)]);
         shift_slice_left(&mut packet_data[..], data_len + 32);
@@ -491,11 +491,7 @@ impl<'s, I, C: Signing> OnionSharedSecretIter<'s, I, C> {
     /// - `hops_path`: The public keys for each hop. These are _y_<sub>i</sub> in the specification.
     /// - `session_key`: The ephemeral secret key for the onion packet. It must be generated securely using a random process.
     ///     This is _x_ in the specification.
-    pub fn new(
-        hops_path_iter: I,
-        session_key: SecretKey,
-        secp_ctx: &'s Secp256k1<C>,
-    ) -> OnionSharedSecretIter<I, C> {
+    pub fn new(hops_path_iter: I, session_key: SecretKey, secp_ctx: &'s Secp256k1<C>) -> Self {
         OnionSharedSecretIter {
             hops_path_iter,
             secp_ctx,
@@ -511,7 +507,7 @@ impl<'s, 'i, I: Iterator<Item = &'i PublicKey>, C: Signing> Iterator
 
     fn next(&mut self) -> Option<Self::Item> {
         self.hops_path_iter.next().map(|pk| {
-            let shared_secret = SharedSecret::new(&pk, &self.ephemeral_secret_key);
+            let shared_secret = SharedSecret::new(pk, &self.ephemeral_secret_key);
 
             let ephemeral_public_key = self.ephemeral_secret_key.public_key(self.secp_ctx);
             self.ephemeral_secret_key = derive_next_hop_ephemeral_secret_key(
@@ -527,7 +523,7 @@ impl<'s, 'i, I: Iterator<Item = &'i PublicKey>, C: Signing> Iterator
 
 /// Derives keys for forwarding the onion packet.
 fn derive_hops_forward_keys<C: Signing>(
-    hops_path: &Vec<PublicKey>,
+    hops_path: &[PublicKey],
     session_key: SecretKey,
     secp_ctx: &Secp256k1<C>,
 ) -> Vec<ForwardKeys> {
@@ -541,8 +537,8 @@ fn shift_slice_right(arr: &mut [u8], amt: usize) {
     for i in (amt..arr.len()).rev() {
         arr[i] = arr[i - amt];
     }
-    for i in 0..amt {
-        arr[i] = 0;
+    for item in arr.iter_mut().take(amt) {
+        *item = 0;
     }
 }
 
@@ -552,16 +548,16 @@ fn shift_slice_left(arr: &mut [u8], amt: usize) {
     for i in 0..pivot {
         arr[i] = arr[i + amt];
     }
-    for i in pivot..arr.len() {
-        arr[i] = 0;
+    for item in arr.iter_mut().skip(pivot) {
+        *item = 0;
     }
 }
 
 /// Computes hmac of packet_data and optional associated data using the key `hmac_key`.
 fn compute_hmac(hmac_key: &[u8; 32], packet_data: &[u8], assoc_data: Option<&[u8]>) -> [u8; 32] {
     let mut hmac_engine = Hmac::<Sha256>::new_from_slice(hmac_key).expect("valid hmac key");
-    hmac_engine.update(&packet_data);
-    if let Some(ref assoc_data) = assoc_data {
+    hmac_engine.update(packet_data);
+    if let Some(assoc_data) = assoc_data {
         hmac_engine.update(assoc_data);
     }
     hmac_engine.finalize().into_bytes().into()
@@ -596,7 +592,7 @@ fn derive_next_hop_ephemeral_secret_key(
     let blinding_factor: [u8; 32] = {
         let mut sha = Sha256::new();
         sha.update(&ephemeral_public_key.serialize()[..]);
-        sha.update(shared_secret.as_ref());
+        sha.update(shared_secret);
         sha.finalize().into()
     };
 
@@ -697,7 +693,7 @@ fn construct_onion_packet(
     for (i, (data, keys)) in hops_data.iter().zip(hops_keys.iter()).rev().enumerate() {
         let data_len = data.len();
         shift_slice_right(&mut packet_data, data_len + 32);
-        packet_data[0..data_len].copy_from_slice(&data);
+        packet_data[0..data_len].copy_from_slice(data);
         packet_data[data_len..(data_len + 32)].copy_from_slice(&hmac);
 
         let mut chacha = ChaCha20::new(&keys.rho.into(), &[0u8; 12].into());
