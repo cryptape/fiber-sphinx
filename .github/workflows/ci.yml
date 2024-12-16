@@ -21,11 +21,18 @@ jobs:
           - stable
           - beta
           - nightly
+        command:
+          - build
+          - test
+        include:
+          - toolchain: "1.76.0"
+            command: clippy
     steps:
       - uses: actions/checkout@v4
       - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
-      - run: cargo build --verbose
-      - run: cargo test --verbose
+      - run: cargo ${{ matrix.command }} --verbose
+        env:
+          RUSTFLAGS: "-Dwarnings"
 
   ci:
     name: Build and Test
