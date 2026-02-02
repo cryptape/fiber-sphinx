@@ -125,7 +125,8 @@ fiber-sphinx/
 │   └── CONTRIBUTING.md # Contribution guidelines
 └── .github/workflows/
     ├── ci.yml          # CI workflow (build, test, clippy)
-    └── cov.yml         # Coverage workflow
+    ├── cov.yml         # Coverage workflow
+    └── deploy.yml      # Deploy to crates.io on tag push
 ```
 
 ## CI Requirements
@@ -134,6 +135,21 @@ The CI runs on Rust 1.76.0, stable, beta, and nightly. All must pass:
 - `cargo build` - Compilation with no errors
 - `cargo test` - All tests pass
 - `cargo clippy` - No warnings (with `-Dwarnings`)
+
+## Releasing
+
+To publish a new version to crates.io:
+
+1. Update the version in `Cargo.toml`
+2. Commit the version bump
+3. Create and push a tag: `git tag v<version> && git push origin v<version>`
+4. The deploy workflow will automatically publish to crates.io
+
+**Setup:** Uses crates.io Trusted Publishers (no API token required). Configure the trusted
+publisher at https://crates.io/crates/fiber-sphinx/settings with:
+- Repository: `cryptape/fiber-sphinx`
+- Workflow: `deploy.yml`
+- Environment: `crates.io`
 
 ## Contributing Workflow
 
