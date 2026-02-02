@@ -7,12 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-02-02
+
 ### Added
 - Deploy workflow for automatic crates.io publishing on tag push
+- CHANGELOG.md documenting all releases
 
 ### Changed
 - Refactored code according to clippy warnings
 - Added clippy to CI pipeline
+- Added coverage workflow
 - Moved tests into a separate file
 
 ### Documentation
@@ -76,7 +80,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hop shared secret derivation
 - Filler generation for packet construction
 
-[Unreleased]: https://github.com/cryptape/fiber-sphinx/compare/v2.2.0...HEAD
+[Unreleased]: https://github.com/cryptape/fiber-sphinx/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/cryptape/fiber-sphinx/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/cryptape/fiber-sphinx/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/cryptape/fiber-sphinx/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/cryptape/fiber-sphinx/compare/v1.0.1...v2.0.0
