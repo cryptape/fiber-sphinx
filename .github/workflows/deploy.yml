@@ -1,0 +1,25 @@
+name: Deploy
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    environment: crates.io
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update 1.76.0 && rustup default 1.76.0
+      - name: Run tests
+        run: cargo test --verbose
+        env:
+          RUSTFLAGS: "-Dwarnings"
+      - name: Publish
+        run: cargo publish

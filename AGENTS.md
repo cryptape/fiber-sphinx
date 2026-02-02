@@ -125,7 +125,8 @@ fiber-sphinx/
 │   └── CONTRIBUTING.md # Contribution guidelines
 └── .github/workflows/
     ├── ci.yml          # CI workflow (build, test, clippy)
-    └── cov.yml         # Coverage workflow
+    ├── cov.yml         # Coverage workflow
+    └── deploy.yml      # Deploy to crates.io on tag push
 ```
 
 ## CI Requirements
@@ -134,6 +135,39 @@ The CI runs on Rust 1.76.0, stable, beta, and nightly. All must pass:
 - `cargo build` - Compilation with no errors
 - `cargo test` - All tests pass
 - `cargo clippy` - No warnings (with `-Dwarnings`)
+
+## Releasing
+
+To publish a new version to crates.io:
+
+1. Update the version in `Cargo.toml`
+2. Update `CHANGELOG.md`:
+   - Move items from `[Unreleased]` to new version section
+   - Add release date in format `YYYY-MM-DD`
+   - Add comparison link at bottom of file
+   - Update `[Unreleased]` link to compare against new version
+3. Commit the version bump
+4. Create and push a tag: `git tag v<version> && git push origin v<version>`
+5. The deploy workflow will automatically publish to crates.io
+
+### CHANGELOG Format
+
+Follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format:
+- **Added** for new features
+- **Changed** for changes in existing functionality
+- **Deprecated** for soon-to-be removed features
+- **Removed** for now removed features
+- **Fixed** for bug fixes
+- **Security** for vulnerability fixes
+- **Documentation** for doc-only changes
+
+### Trusted Publisher Setup
+
+Uses crates.io Trusted Publishers (no API token required). Configure the trusted
+publisher at https://crates.io/crates/fiber-sphinx/settings with:
+- Repository: `cryptape/fiber-sphinx`
+- Workflow: `deploy.yml`
+- Environment: `crates.io`
 
 ## Contributing Workflow
 
