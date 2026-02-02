@@ -164,10 +164,11 @@ Follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format:
 ### Trusted Publisher Setup
 
 Uses crates.io Trusted Publishers (no API token required). Configure the trusted
-publisher at https://crates.io/crates/fiber-sphinx/settings with:
-- Repository: `cryptape/fiber-sphinx`
-- Workflow: `deploy.yml`
-- Environment: `crates.io`
+publisher at https://crates.io/crates/fiber-sphinx/settings → Trusted Publishing:
+- Repository owner: `cryptape`
+- Repository name: `fiber-sphinx`
+- Workflow filename: `deploy.yml`
+- Environment: (leave empty)
 
 ## Contributing Workflow
 
