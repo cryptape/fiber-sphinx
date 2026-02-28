@@ -3,7 +3,7 @@
 //! [Sphinx]: http://www.cypherpunks.ca/~iang/pubs/Sphinx_Oakland09.pdf
 //! [Fiber]: https://github.com/nervosnetwork/fiber
 //!
-//! See more in the [Specification](https://github.com/cryptape/fiber-sphinx/blob/develop/docs/spec.md).
+//! See more in the [Specification](https://github.com/nervosnetwork/fiber-sphinx/blob/develop/docs/spec.md).
 //!
 //! ## Example
 //!

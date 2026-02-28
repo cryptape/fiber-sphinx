@@ -5,7 +5,7 @@ edition = "2021"
 license-file = "COPYING.md"
 description = "A Rust implementation of the Sphinx mix network."
 documentation = "https://docs.rs/fiber-sphinx"
-homepage = "https://github.com/cryptape/fiber-sphinx"
+homepage = "https://github.com/nervosnetwork/fiber-sphinx"
 
 [dependencies]
 secp256k1 = { version = "0.30", features = ["serde"] }
