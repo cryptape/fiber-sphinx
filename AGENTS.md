@@ -165,7 +165,7 @@ Follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format:
 
 Uses crates.io Trusted Publishers (no API token required). Configure the trusted
 publisher at https://crates.io/crates/fiber-sphinx/settings → Trusted Publishing:
-- Repository owner: `cryptape`
+- Repository owner: `nervosnetwork`
 - Repository name: `fiber-sphinx`
 - Workflow filename: `deploy.yml`
 - Environment: (leave empty)
