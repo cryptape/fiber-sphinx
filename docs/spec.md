@@ -63,7 +63,7 @@ There are there hash function used in the equations: $h_b$, $h_\mu$, and $h_\rho
 
 ### Filler Generation
 
-Filler is used to fill the blanks when a hop removes its message from the packet. The origin node generates the filler string from $n_0$ to $\n_{v-2}$ incrementally.
+Filler is used to fill the blanks when a hop removes its message from the packet. The origin node generates the filler string from $n_0$ to $n_{v-2}$ incrementally.
 
 Let $\phi_0$ be an empty string. For $0 \lt i \lt v$:
 
@@ -130,7 +130,7 @@ Refer to the illustration in the Figure 2.
 
 ## Peeling and Forwarding
 
-Input:  The node $n_i$ who possesses the private key $x_i$ has received the message $(\alpha_i, \beta_i, \gamma_i)$.
+Input: The node $n_i$ who possesses the private key $x_i$ has received the message $(\alpha_i, \beta_i, \gamma_i)$.
 
 The node $n_i$ can get the Diffie-Hellman shared secret $s_i$ from $x_i$ and $\alpha_i$.
 
