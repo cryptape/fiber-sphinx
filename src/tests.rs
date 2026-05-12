@@ -334,6 +334,37 @@ fn parse_lightning_error_packet_data(payload: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[test]
+fn test_verify_hmac() {
+    let key = [0x11; 32];
+    let packet_data = b"packet data";
+    let assoc_data = b"associated data";
+    let hmac = compute_hmac(&key, packet_data, Some(assoc_data));
+
+    assert!(verify_hmac(&key, packet_data, Some(assoc_data), &hmac));
+
+    let mut tampered_hmac = hmac;
+    tampered_hmac[0] ^= 1;
+    assert!(!verify_hmac(
+        &key,
+        packet_data,
+        Some(assoc_data),
+        &tampered_hmac
+    ));
+    assert!(!verify_hmac(
+        &key,
+        packet_data,
+        Some(b"wrong associated data"),
+        &hmac
+    ));
+    assert!(!verify_hmac(
+        &key,
+        packet_data,
+        Some(assoc_data),
+        &hmac[..31]
+    ));
+}
+
+#[test]
 fn test_parse_onion_error_packet() {
     let secp = Secp256k1::new();
     let hops_path = get_test_hops_path();

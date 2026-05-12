@@ -250,10 +250,7 @@ impl OnionPacket {
         let rho = derive_key(HMAC_KEY_RHO, shared_secret.as_ref());
         let mu = derive_key(HMAC_KEY_MU, shared_secret.as_ref());
 
-        let expected_hmac = compute_hmac(&mu, &self.packet_data, assoc_data);
-
-        // TODO: constant time comparison
-        if expected_hmac != self.hmac {
+        if !verify_hmac(&mu, &self.packet_data, assoc_data, &self.hmac) {
             return Err(SphinxError::HmacMismatch);
         }
 
@@ -361,8 +358,12 @@ impl OnionErrorPacket {
             let ReturnKeys { ammag, um } = ReturnKeys::new(&shared_secret);
             packet = packet.xor_cipher_stream_with_ammag(ammag);
             if let Some(error) = parse_payload(&packet.packet_data[32..]) {
-                let hmac = compute_hmac(&um, &packet.packet_data[32..], None);
-                if hmac == packet.packet_data[..32] {
+                if verify_hmac(
+                    &um,
+                    &packet.packet_data[32..],
+                    None,
+                    &packet.packet_data[..32],
+                ) {
                     return Some((error, index));
                 }
             }
@@ -564,6 +565,20 @@ fn compute_hmac(hmac_key: &[u8; 32], packet_data: &[u8], assoc_data: Option<&[u8
         hmac_engine.update(assoc_data);
     }
     hmac_engine.finalize().into_bytes().into()
+}
+
+fn verify_hmac(
+    hmac_key: &[u8; 32],
+    packet_data: &[u8],
+    assoc_data: Option<&[u8]>,
+    expected_hmac: &[u8],
+) -> bool {
+    let mut hmac_engine = Hmac::<Sha256>::new_from_slice(hmac_key).expect("valid hmac key");
+    hmac_engine.update(packet_data);
+    if let Some(assoc_data) = assoc_data {
+        hmac_engine.update(assoc_data);
+    }
+    hmac_engine.verify_slice(expected_hmac).is_ok()
 }
 
 /// Forwards the cursor of the stream cipher by `n` bytes.
