@@ -263,15 +263,18 @@ impl OnionPacket {
 
         // data | hmac | remaining
         let data_len = get_hop_data_len(&packet_data).ok_or(SphinxError::HopDataLenUnavailable)?;
-        if data_len > packet_data_len {
+        let hmac_end = data_len
+            .checked_add(32)
+            .ok_or(SphinxError::HopDataLenTooLarge)?;
+        if hmac_end > packet_data_len {
             return Err(SphinxError::HopDataLenTooLarge);
         }
         let hop_data = packet_data[0..data_len].to_vec();
         let mut hmac = [0; 32];
-        hmac.copy_from_slice(&packet_data[data_len..(data_len + 32)]);
-        shift_slice_left(&mut packet_data[..], data_len + 32);
+        hmac.copy_from_slice(&packet_data[data_len..hmac_end]);
+        shift_slice_left(&mut packet_data[..], hmac_end);
         // Encrypt 0 bytes until the end
-        chacha.apply_keystream(&mut packet_data[(packet_data_len - data_len - 32)..]);
+        chacha.apply_keystream(&mut packet_data[(packet_data_len - hmac_end)..]);
 
         let public_key =
             derive_next_hop_ephemeral_public_key(self.public_key, shared_secret.as_ref(), secp_ctx);
