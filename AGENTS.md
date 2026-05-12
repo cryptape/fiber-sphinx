@@ -10,7 +10,7 @@ It implements onion message encryption/decryption for anonymous message routing.
 ## Build, Test, and Lint Commands
 
 ### Prerequisites
-- Rust toolchain 1.76.0 (specified in `rust-toolchain.toml`)
+- Rust toolchain 1.93.0 (specified in `rust-toolchain.toml`)
 - Components: rustfmt, clippy
 
 ### Build
@@ -44,7 +44,7 @@ cargo doc --open    # Generate and open documentation
 
 ### Rust Edition and Version
 - **Edition**: 2021
-- **Minimum Rust Version**: 1.76.0
+- **Minimum Rust Version**: 1.93.0
 
 ### Formatting
 - Always run `cargo fmt` before committing
@@ -131,7 +131,7 @@ fiber-sphinx/
 
 ## CI Requirements
 
-The CI runs on Rust 1.76.0, stable, beta, and nightly. All must pass:
+The CI runs on Rust 1.93.0, stable, beta, and nightly. All must pass:
 - `cargo build` - Compilation with no errors
 - `cargo test` - All tests pass
 - `cargo clippy` - No warnings (with `-Dwarnings`)
