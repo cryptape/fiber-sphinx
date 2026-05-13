@@ -15,7 +15,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - run: rustup update 1.76.0 && rustup default 1.76.0
+      - run: rustup update 1.93.0 && rustup default 1.93.0
       - name: Run tests
         run: cargo test --verbose
         env:
