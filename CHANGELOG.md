@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Bumped the pinned Rust toolchain to 1.93.0
+
 ## [2.3.0] - 2026-02-02
 
 ### Added
