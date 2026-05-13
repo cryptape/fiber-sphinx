@@ -85,7 +85,7 @@ use chacha20::{
 };
 use hmac::{Hmac, Mac as _};
 use secp256k1::{
-    ecdh::SharedSecret, PublicKey, Scalar, Secp256k1, SecretKey, Signing, Verification,
+    constants, ecdh::SharedSecret, PublicKey, Scalar, Secp256k1, SecretKey, Signing, Verification,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -133,7 +133,9 @@ pub struct OnionPacket {
 ///   PublicKey::from_str("027f31ebc5462c1fdce1b737ecff52d37d75dea43ce11c74d25aa297165faa2007").expect("valid public key"),
 /// ];
 /// let session_key = SecretKey::from_slice(&[0x41; 32]).expect("32 bytes, within curve order");
-/// let hops_ss = OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp).collect::<Vec<_>>();
+/// let hops_ss = OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp)
+///     .collect::<Result<Vec<_>, _>>()
+///     .expect("shared secrets");
 ///
 /// // The node 0324653...0ab1c generates the error
 /// let shared_secret = hops_ss[1];
@@ -158,6 +160,8 @@ impl OnionPacket {
     ///   HMAC. This allows each hop to verify that the associated data has not been tampered with. This is _A_ in the
     ///   specification.
     /// - `onion_packet_len`: The length of the onion packet. The packet has the same size for each hop.
+    ///
+    /// If this returns [`SphinxError::InvalidBlindingFactor`], retry with a different session key.
     pub fn create<C: Signing>(
         session_key: SecretKey,
         hops_path: Vec<PublicKey>,
@@ -173,7 +177,7 @@ impl OnionPacket {
             return Err(SphinxError::HopsIsEmpty);
         }
 
-        let hops_keys = derive_hops_forward_keys(&hops_path, session_key, secp_ctx);
+        let hops_keys = derive_hops_forward_keys(&hops_path, session_key, secp_ctx)?;
         let pad_key = derive_key(HMAC_KEY_PAD, &session_key.secret_bytes());
         let packet_data = generate_padding_data(packet_data_len, &pad_key);
         let filler = generate_filler(packet_data_len, &hops_keys, &hops_data)?;
@@ -313,8 +317,11 @@ impl OnionPacket {
         // Encrypt 0 bytes until the end
         chacha.apply_keystream(&mut packet_data[(packet_data_len - hmac_end)..]);
 
-        let public_key =
-            derive_next_hop_ephemeral_public_key(self.public_key, shared_secret.as_ref(), secp_ctx);
+        let public_key = derive_next_hop_ephemeral_public_key(
+            self.public_key,
+            shared_secret.as_ref(),
+            secp_ctx,
+        )?;
 
         Ok((
             hop_data,
@@ -394,6 +401,7 @@ impl OnionErrorPacket {
         for (index, shared_secret) in
             OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp_ctx).enumerate()
         {
+            let shared_secret = shared_secret.ok()?;
             let ReturnKeys { ammag, um } = ReturnKeys::new(&shared_secret);
             packet = packet.xor_cipher_stream_with_ammag(ammag);
             let payload = &packet.packet_data[PACKET_HMAC_LEN..];
@@ -455,6 +463,9 @@ pub enum SphinxError {
 
     #[error("Invalid public key")]
     PublicKeyInvalid,
+
+    #[error("Invalid blinding factor")]
+    InvalidBlindingFactor,
 }
 
 /// Keys used to forward the onion packet.
@@ -517,7 +528,9 @@ pub fn derive_ammag_key(shared_secret: &[u8]) -> [u8; 32] {
 /// let hops_path: Vec<_> = hops_keys.iter().map(|sk| sk.public_key(&secp)).collect();
 /// let session_key = SecretKey::from_slice(&[0x41; 32]).expect("32 bytes, within curve order");
 /// // Gets shared secrets for each hop
-/// let hops_ss: Vec<_> = OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp).collect();
+/// let hops_ss: Vec<_> = OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp)
+///     .collect::<Result<Vec<_>, _>>()
+///     .expect("shared secrets");
 /// ```
 #[derive(Clone)]
 pub struct OnionSharedSecretIter<'s, I, C: Signing> {
@@ -545,7 +558,7 @@ impl<'s, I, C: Signing> OnionSharedSecretIter<'s, I, C> {
 impl<'s, 'i, I: Iterator<Item = &'i PublicKey>, C: Signing> Iterator
     for OnionSharedSecretIter<'s, I, C>
 {
-    type Item = [u8; 32];
+    type Item = Result<[u8; 32], SphinxError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.hops_path_iter.next().map(|pk| {
@@ -556,9 +569,9 @@ impl<'s, 'i, I: Iterator<Item = &'i PublicKey>, C: Signing> Iterator
                 self.ephemeral_secret_key,
                 &ephemeral_public_key,
                 shared_secret.as_ref(),
-            );
+            )?;
 
-            shared_secret.secret_bytes()
+            Ok(shared_secret.secret_bytes())
         })
     }
 }
@@ -568,9 +581,9 @@ fn derive_hops_forward_keys<C: Signing>(
     hops_path: &[PublicKey],
     session_key: SecretKey,
     secp_ctx: &Secp256k1<C>,
-) -> Vec<ForwardKeys> {
+) -> Result<Vec<ForwardKeys>, SphinxError> {
     OnionSharedSecretIter::new(hops_path.iter(), session_key, secp_ctx)
-        .map(|shared_secret| ForwardKeys::new(&shared_secret))
+        .map(|shared_secret| shared_secret.map(|shared_secret| ForwardKeys::new(&shared_secret)))
         .collect()
 }
 
@@ -644,44 +657,82 @@ fn forward_stream_cipher<S: StreamCipher>(stream: &mut S, n: usize) {
 /// - `shared_secret`: the shared secret of the current node $s_{i-1}$
 ///
 /// Returns the ephemeral secret key for the mix node $n_i$, which is $x b_0 b_1 \cdots b_{i-1}$.
+///
+/// Returns [`SphinxError::InvalidBlindingFactor`] when the SHA256 output reduced modulo the
+/// secp256k1 curve order is zero. In that case, `mul_tweak` would produce an invalid zero
+/// secret key.
 fn derive_next_hop_ephemeral_secret_key(
     ephemeral_secret_key: SecretKey,
     ephemeral_public_key: &PublicKey,
     shared_secret: &[u8],
-) -> SecretKey {
-    let blinding_factor: [u8; 32] = {
+) -> Result<SecretKey, SphinxError> {
+    let blinding_factor = {
         let mut sha = Sha256::new();
         sha.update(&ephemeral_public_key.serialize()[..]);
         sha.update(shared_secret);
-        sha.finalize().into()
+        scalar_from_blinding_factor(sha.finalize().into())?
     };
 
     ephemeral_secret_key
-        .mul_tweak(&Scalar::from_be_bytes(blinding_factor).expect("valid scalar"))
-        .expect("valid mul tweak")
+        .mul_tweak(&blinding_factor)
+        .map_err(|_| SphinxError::InvalidBlindingFactor)
 }
 
 /// Derives the ephemeral public key for the next hop.
 ///
 /// This is the _alpha_ in the specification.
+///
+/// Returns [`SphinxError::InvalidBlindingFactor`] when the SHA256 output reduced modulo the
+/// secp256k1 curve order is zero. In that case, `mul_tweak` would produce the invalid point at
+/// infinity.
 fn derive_next_hop_ephemeral_public_key<C: Verification>(
     ephemeral_public_key: PublicKey,
     shared_secret: &[u8],
     secp_ctx: &Secp256k1<C>,
-) -> PublicKey {
-    let blinding_factor: [u8; 32] = {
+) -> Result<PublicKey, SphinxError> {
+    let blinding_factor = {
         let mut sha = Sha256::new();
         sha.update(&ephemeral_public_key.serialize()[..]);
         sha.update(shared_secret.as_ref());
-        sha.finalize().into()
+        scalar_from_blinding_factor(sha.finalize().into())?
     };
 
     ephemeral_public_key
-        .mul_tweak(
-            secp_ctx,
-            &Scalar::from_be_bytes(blinding_factor).expect("valid scalar"),
-        )
-        .expect("valid mul tweak")
+        .mul_tweak(secp_ctx, &blinding_factor)
+        .map_err(|_| SphinxError::InvalidBlindingFactor)
+}
+
+fn scalar_from_blinding_factor(mut blinding_factor: [u8; 32]) -> Result<Scalar, SphinxError> {
+    if blinding_factor >= constants::CURVE_ORDER {
+        subtract_secp256k1_order(&mut blinding_factor);
+    }
+
+    if blinding_factor == constants::ZERO {
+        return Err(SphinxError::InvalidBlindingFactor);
+    }
+
+    Scalar::from_be_bytes(blinding_factor).map_err(|_| SphinxError::InvalidBlindingFactor)
+}
+
+// The secp256k1 crate exposes the curve order but not a modulo-reducing Scalar
+// constructor. A SHA256 output is less than 2^256, so one subtraction is enough.
+// A big-integer dependency would add audit surface for this fixed-size operation
+// without simplifying it.
+fn subtract_secp256k1_order(value: &mut [u8; 32]) {
+    let mut borrow = 0u16;
+
+    for (byte, order_byte) in value.iter_mut().zip(constants::CURVE_ORDER.iter()).rev() {
+        let subtrahend = *order_byte as u16 + borrow;
+        let minuend = *byte as u16;
+
+        if minuend >= subtrahend {
+            *byte = (minuend - subtrahend) as u8;
+            borrow = 0;
+        } else {
+            *byte = (minuend + 256 - subtrahend) as u8;
+            borrow = 1;
+        }
+    }
 }
 
 /// Derives a key from the shared secret using HMAC.
