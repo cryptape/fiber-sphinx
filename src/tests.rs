@@ -334,6 +334,37 @@ fn parse_lightning_error_packet_data(payload: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[test]
+fn test_verify_hmac() {
+    let key = [0x11; 32];
+    let packet_data = b"packet data";
+    let assoc_data = b"associated data";
+    let hmac = compute_hmac(&key, packet_data, Some(assoc_data));
+
+    assert!(verify_hmac(&key, packet_data, Some(assoc_data), &hmac));
+
+    let mut tampered_hmac = hmac;
+    tampered_hmac[0] ^= 1;
+    assert!(!verify_hmac(
+        &key,
+        packet_data,
+        Some(assoc_data),
+        &tampered_hmac
+    ));
+    assert!(!verify_hmac(
+        &key,
+        packet_data,
+        Some(b"wrong associated data"),
+        &hmac
+    ));
+    assert!(!verify_hmac(
+        &key,
+        packet_data,
+        Some(assoc_data),
+        &hmac[..31]
+    ));
+}
+
+#[test]
 fn test_parse_onion_error_packet() {
     let secp = Secp256k1::new();
     let hops_path = get_test_hops_path();
@@ -395,4 +426,42 @@ fn test_onion_error_packet_concat_split() {
 
     assert_eq!(hmac, expected_hmac);
     assert_eq!(payload, expected_payload);
+}
+
+fn assert_peel_rejects_hop_data_len(data_len: usize) {
+    const SMALL_PACKET_DATA_LEN: usize = 64;
+
+    let secp = Secp256k1::new();
+    let hop_key = SecretKey::from_slice(&[0x20; 32]).expect("32 bytes, within curve order");
+    let hops_path = vec![hop_key.public_key(&secp)];
+    let session_key = SecretKey::from_slice(&[0x41; 32]).expect("32 bytes, within curve order");
+    let assoc_data = vec![0x42u8; 32];
+
+    let packet = OnionPacket::create(
+        session_key,
+        hops_path,
+        vec![vec![0]],
+        Some(assoc_data.clone()),
+        SMALL_PACKET_DATA_LEN,
+        &secp,
+    )
+    .expect("new onion packet");
+
+    let res = packet.peel(&hop_key, Some(&assoc_data), &secp, |_| Some(data_len));
+    assert_eq!(res, Err(SphinxError::HopDataLenTooLarge));
+}
+
+#[test]
+fn test_peel_rejects_hop_data_len_l_minus_31() {
+    assert_peel_rejects_hop_data_len(64 - 31);
+}
+
+#[test]
+fn test_peel_rejects_hop_data_len_l() {
+    assert_peel_rejects_hop_data_len(64);
+}
+
+#[test]
+fn test_peel_rejects_hop_data_len_l_plus_1() {
+    assert_peel_rejects_hop_data_len(64 + 1);
 }
