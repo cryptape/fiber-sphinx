@@ -418,6 +418,23 @@ fn test_parse_onion_error_packet() {
 }
 
 #[test]
+fn test_parse_onion_error_packet_checks_hmac_before_payload() {
+    let secp = Secp256k1::new();
+    let hops_path = get_test_hops_path();
+    let session_key = get_test_session_key();
+    let hops_ss: Vec<_> =
+        OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp).collect();
+    let error_payload = <Vec<u8>>::from_hex("0002200200fe0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000").expect("valid hex");
+
+    let packet = OnionErrorPacket::create(&hops_ss[1], error_payload);
+    let error: Option<(Vec<u8>, usize)> = packet.parse(hops_path, session_key, |_| {
+        panic!("payload parser should not be called when hmac does not match")
+    });
+
+    assert!(error.is_none());
+}
+
+#[test]
 fn test_onion_error_packet_concat_split() {
     let expected_hmac = [0x11; 32];
     let expected_payload = vec![0x22];
