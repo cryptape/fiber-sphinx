@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `OnionPacket::from_bytes_with_packet_data_len` to validate the expected packet data length while parsing bytes
+- `SphinxError::PacketDataLenMismatch` for bytes that do not match the expected packet data length
+
+### Deprecated
+- `OnionPacket::from_bytes`; use `OnionPacket::from_bytes_with_packet_data_len` when the packet data length is known
+
 ## [2.3.0] - 2026-02-02
 
 ### Added

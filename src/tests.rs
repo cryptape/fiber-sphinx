@@ -44,10 +44,56 @@ fn test_onion_packet_from_bytes() {
         packet_data: vec![2],
         hmac: [3; 32],
     };
+    #[allow(deprecated)]
     let packet_from_bytes_res = OnionPacket::from_bytes(packet.clone().into_bytes());
     assert!(packet_from_bytes_res.is_ok());
     let packet_from_bytes = packet_from_bytes_res.unwrap();
     assert_eq!(packet_from_bytes, packet);
+}
+
+#[test]
+fn test_onion_packet_from_bytes_with_packet_data_len() {
+    let public_key = PublicKey::from_slice(
+        Vec::from_hex("02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619")
+            .expect("valid hex")
+            .as_ref(),
+    )
+    .expect("valid public key");
+    let packet = OnionPacket {
+        version: 1,
+        public_key,
+        packet_data: vec![2, 4],
+        hmac: [3; 32],
+    };
+
+    let packet_from_bytes_res =
+        OnionPacket::from_bytes_with_packet_data_len(packet.clone().into_bytes(), 2);
+    assert!(packet_from_bytes_res.is_ok());
+    let packet_from_bytes = packet_from_bytes_res.unwrap();
+    assert_eq!(packet_from_bytes, packet);
+}
+
+#[test]
+fn test_onion_packet_from_bytes_with_packet_data_len_mismatch() {
+    let public_key = PublicKey::from_slice(
+        Vec::from_hex("02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619")
+            .expect("valid hex")
+            .as_ref(),
+    )
+    .expect("valid public key");
+    let packet = OnionPacket {
+        version: 1,
+        public_key,
+        packet_data: vec![2, 4],
+        hmac: [3; 32],
+    };
+
+    let packet_from_bytes_res =
+        OnionPacket::from_bytes_with_packet_data_len(packet.into_bytes(), 1);
+    assert_eq!(
+        packet_from_bytes_res,
+        Err(SphinxError::PacketDataLenMismatch)
+    );
 }
 
 #[test]
