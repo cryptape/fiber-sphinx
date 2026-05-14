@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-05-14
+
 ### Added
 - `OnionPacket::from_bytes_with_packet_data_len` to validate the expected packet data length while parsing bytes
 - `SphinxError::PacketDataLenMismatch` for bytes that do not match the expected packet data length
@@ -94,7 +96,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hop shared secret derivation
 - Filler generation for packet construction
 
-[Unreleased]: https://github.com/nervosnetwork/fiber-sphinx/compare/v2.3.0...HEAD
+[Unreleased]: https://github.com/nervosnetwork/fiber-sphinx/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/nervosnetwork/fiber-sphinx/compare/v2.3.0...v3.0.0
 [2.3.0]: https://github.com/nervosnetwork/fiber-sphinx/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/nervosnetwork/fiber-sphinx/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/nervosnetwork/fiber-sphinx/compare/v2.0.0...v2.1.0
