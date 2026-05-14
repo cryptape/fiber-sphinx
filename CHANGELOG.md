@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `OnionPacket::from_bytes_with_packet_data_len` to validate the expected packet data length while parsing bytes
+- `SphinxError::PacketDataLenMismatch` for bytes that do not match the expected packet data length
+- `SphinxError::InvalidBlindingFactor` for blinding factors that reduce to zero modulo the secp256k1 curve order
+
+### Changed
+- `OnionSharedSecretIter` now returns `Result<[u8; 32], SphinxError>` to report invalid blinding factors
+
+### Fixed
+- Reduced SHA256 blinding factors modulo the secp256k1 curve order before applying key tweaks
+
+### Deprecated
+- `OnionPacket::from_bytes`; use `OnionPacket::from_bytes_with_packet_data_len` when the packet data length is known
+
 ## [2.3.0] - 2026-02-02
 
 ### Added

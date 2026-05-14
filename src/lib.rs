@@ -85,7 +85,7 @@ use chacha20::{
 };
 use hmac::{Hmac, Mac as _};
 use secp256k1::{
-    ecdh::SharedSecret, PublicKey, Scalar, Secp256k1, SecretKey, Signing, Verification,
+    constants, ecdh::SharedSecret, PublicKey, Scalar, Secp256k1, SecretKey, Signing, Verification,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -96,6 +96,10 @@ const HMAC_KEY_PAD: &[u8] = b"pad";
 const HMAC_KEY_UM: &[u8] = b"um";
 const HMAC_KEY_AMMAG: &[u8] = b"ammag";
 const CHACHA_NONCE: [u8; 12] = [0u8; 12];
+const PACKET_VERSION_LEN: usize = 1;
+const PACKET_PUBLIC_KEY_LEN: usize = 33;
+const PACKET_HMAC_LEN: usize = 32;
+const MIN_ONION_PACKET_LEN: usize = PACKET_VERSION_LEN + PACKET_PUBLIC_KEY_LEN + PACKET_HMAC_LEN;
 
 /// Onion packet to send encrypted message via multiple hops.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -107,7 +111,7 @@ pub struct OnionPacket {
     /// Encrypted packet data. _Beta_ in the specification.
     pub packet_data: Vec<u8>,
     /// HMAC of the packet data. _Gamma_ in the specification.
-    pub hmac: [u8; 32],
+    pub hmac: [u8; PACKET_HMAC_LEN],
 }
 
 /// Onion error packet to return errors to the origin node.
@@ -129,7 +133,9 @@ pub struct OnionPacket {
 ///   PublicKey::from_str("027f31ebc5462c1fdce1b737ecff52d37d75dea43ce11c74d25aa297165faa2007").expect("valid public key"),
 /// ];
 /// let session_key = SecretKey::from_slice(&[0x41; 32]).expect("32 bytes, within curve order");
-/// let hops_ss = OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp).collect::<Vec<_>>();
+/// let hops_ss = OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp)
+///     .collect::<Result<Vec<_>, _>>()
+///     .expect("shared secrets");
 ///
 /// // The node 0324653...0ab1c generates the error
 /// let shared_secret = hops_ss[1];
@@ -154,6 +160,8 @@ impl OnionPacket {
     ///   HMAC. This allows each hop to verify that the associated data has not been tampered with. This is _A_ in the
     ///   specification.
     /// - `onion_packet_len`: The length of the onion packet. The packet has the same size for each hop.
+    ///
+    /// If this returns [`SphinxError::InvalidBlindingFactor`], retry with a different session key.
     pub fn create<C: Signing>(
         session_key: SecretKey,
         hops_path: Vec<PublicKey>,
@@ -169,7 +177,7 @@ impl OnionPacket {
             return Err(SphinxError::HopsIsEmpty);
         }
 
-        let hops_keys = derive_hops_forward_keys(&hops_path, session_key, secp_ctx);
+        let hops_keys = derive_hops_forward_keys(&hops_path, session_key, secp_ctx)?;
         let pad_key = derive_key(HMAC_KEY_PAD, &session_key.secret_bytes());
         let packet_data = generate_padding_data(packet_data_len, &pad_key);
         let filler = generate_filler(packet_data_len, &hops_keys, &hops_data)?;
@@ -186,7 +194,7 @@ impl OnionPacket {
 
     /// Converts the onion packet into a byte vector.
     pub fn into_bytes(self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(1 + 33 + self.packet_data.len() + 32);
+        let mut bytes = Vec::with_capacity(MIN_ONION_PACKET_LEN + self.packet_data.len());
         bytes.push(self.version);
         bytes.extend_from_slice(&self.public_key.serialize());
         bytes.extend_from_slice(&self.packet_data);
@@ -194,17 +202,33 @@ impl OnionPacket {
         bytes
     }
 
-    /// Converts back from a byte vector.
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, SphinxError> {
-        if bytes.len() < 66 {
-            return Err(SphinxError::PacketDataLenTooSmall);
+    /// Converts back from a byte vector with the expected packet data length.
+    ///
+    /// An onion packet has the layout `version || public_key || packet_data || hmac`.
+    /// This function verifies that `bytes` is exactly
+    /// `PACKET_VERSION_LEN + PACKET_PUBLIC_KEY_LEN + packet_data_len + PACKET_HMAC_LEN`
+    /// bytes before copying the HMAC and packet data.
+    pub fn from_bytes_with_packet_data_len(
+        bytes: Vec<u8>,
+        packet_data_len: usize,
+    ) -> Result<Self, SphinxError> {
+        let expected_len = MIN_ONION_PACKET_LEN
+            .checked_add(packet_data_len)
+            .ok_or(SphinxError::PacketDataLenMismatch)?;
+        if bytes.len() != expected_len {
+            return Err(SphinxError::PacketDataLenMismatch);
         }
+
         let version = bytes[0];
-        let public_key =
-            PublicKey::from_slice(&bytes[1..34]).map_err(|_| SphinxError::PublicKeyInvalid)?;
-        let packet_data = (&bytes[34..(bytes.len() - 32)]).into();
-        let mut hmac = [0u8; 32];
-        hmac.copy_from_slice(&bytes[(bytes.len() - 32)..]);
+        let public_key = PublicKey::from_slice(
+            &bytes[PACKET_VERSION_LEN..PACKET_VERSION_LEN + PACKET_PUBLIC_KEY_LEN],
+        )
+        .map_err(|_| SphinxError::PublicKeyInvalid)?;
+        let packet_data_start = PACKET_VERSION_LEN + PACKET_PUBLIC_KEY_LEN;
+        let packet_data_end = packet_data_start + packet_data_len;
+        let packet_data = bytes[packet_data_start..packet_data_end].to_vec();
+        let mut hmac = [0u8; PACKET_HMAC_LEN];
+        hmac.copy_from_slice(&bytes[packet_data_end..]);
 
         Ok(Self {
             version,
@@ -214,11 +238,31 @@ impl OnionPacket {
         })
     }
 
-    pub fn extract_public_key_from_slice(bytes: &[u8]) -> Result<PublicKey, SphinxError> {
-        if bytes.len() < 66 {
+    /// Converts back from a byte vector.
+    ///
+    /// Deprecated because this function accepts any packet data length that can be
+    /// inferred from `bytes`. Use [`OnionPacket::from_bytes_with_packet_data_len`]
+    /// when the expected packet data length is known.
+    #[deprecated(
+        since = "2.4.0",
+        note = "use OnionPacket::from_bytes_with_packet_data_len to verify the packet data length"
+    )]
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, SphinxError> {
+        if bytes.len() < MIN_ONION_PACKET_LEN {
             return Err(SphinxError::PacketDataLenTooSmall);
         }
-        PublicKey::from_slice(&bytes[1..34]).map_err(|_| SphinxError::PublicKeyInvalid)
+        let packet_data_len = bytes.len() - MIN_ONION_PACKET_LEN;
+        Self::from_bytes_with_packet_data_len(bytes, packet_data_len)
+    }
+
+    pub fn extract_public_key_from_slice(bytes: &[u8]) -> Result<PublicKey, SphinxError> {
+        if bytes.len() < MIN_ONION_PACKET_LEN {
+            return Err(SphinxError::PacketDataLenTooSmall);
+        }
+        PublicKey::from_slice(
+            &bytes[PACKET_VERSION_LEN..PACKET_VERSION_LEN + PACKET_PUBLIC_KEY_LEN],
+        )
+        .map_err(|_| SphinxError::PublicKeyInvalid)
     }
 
     /// Derives the shared secret using the node secret key and the ephemeral public key in the onion packet.
@@ -261,20 +305,23 @@ impl OnionPacket {
         // data | hmac | remaining
         let data_len = get_hop_data_len(&packet_data).ok_or(SphinxError::HopDataLenUnavailable)?;
         let hmac_end = data_len
-            .checked_add(32)
+            .checked_add(PACKET_HMAC_LEN)
             .ok_or(SphinxError::HopDataLenTooLarge)?;
         if hmac_end > packet_data_len {
             return Err(SphinxError::HopDataLenTooLarge);
         }
         let hop_data = packet_data[0..data_len].to_vec();
-        let mut hmac = [0; 32];
+        let mut hmac = [0; PACKET_HMAC_LEN];
         hmac.copy_from_slice(&packet_data[data_len..hmac_end]);
         shift_slice_left(&mut packet_data[..], hmac_end);
         // Encrypt 0 bytes until the end
         chacha.apply_keystream(&mut packet_data[(packet_data_len - hmac_end)..]);
 
-        let public_key =
-            derive_next_hop_ephemeral_public_key(self.public_key, shared_secret.as_ref(), secp_ctx);
+        let public_key = derive_next_hop_ephemeral_public_key(
+            self.public_key,
+            shared_secret.as_ref(),
+            secp_ctx,
+        )?;
 
         Ok((
             hop_data,
@@ -302,7 +349,7 @@ impl OnionErrorPacket {
     }
 
     /// Concatenates HMAC and the payload without encryption.
-    pub fn concat(hmac: [u8; 32], mut payload: Vec<u8>) -> Self {
+    pub fn concat(hmac: [u8; PACKET_HMAC_LEN], mut payload: Vec<u8>) -> Self {
         let mut packet_data = hmac.to_vec();
         packet_data.append(&mut payload);
         OnionErrorPacket { packet_data }
@@ -345,8 +392,7 @@ impl OnionErrorPacket {
     where
         F: Fn(&[u8]) -> Option<T>,
     {
-        // The packet must contain the HMAC so it has to be at least 32 bytes
-        if self.packet_data.len() < 32 {
+        if self.packet_data.len() < PACKET_HMAC_LEN {
             return None;
         }
 
@@ -355,15 +401,12 @@ impl OnionErrorPacket {
         for (index, shared_secret) in
             OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp_ctx).enumerate()
         {
+            let shared_secret = shared_secret.ok()?;
             let ReturnKeys { ammag, um } = ReturnKeys::new(&shared_secret);
             packet = packet.xor_cipher_stream_with_ammag(ammag);
-            if let Some(error) = parse_payload(&packet.packet_data[32..]) {
-                if verify_hmac(
-                    &um,
-                    &packet.packet_data[32..],
-                    None,
-                    &packet.packet_data[..32],
-                ) {
+            let payload = &packet.packet_data[PACKET_HMAC_LEN..];
+            if verify_hmac(&um, payload, None, &packet.packet_data[..PACKET_HMAC_LEN]) {
+                if let Some(error) = parse_payload(payload) {
                     return Some((error, index));
                 }
             }
@@ -373,11 +416,11 @@ impl OnionErrorPacket {
     }
 
     /// Splits into HMAC and payload without decryption.
-    pub fn split(self) -> ([u8; 32], Vec<u8>) {
-        let mut hmac = [0u8; 32];
-        if self.packet_data.len() >= 32 {
-            hmac.copy_from_slice(&self.packet_data[..32]);
-            let payload = self.packet_data[32..].to_vec();
+    pub fn split(self) -> ([u8; PACKET_HMAC_LEN], Vec<u8>) {
+        let mut hmac = [0u8; PACKET_HMAC_LEN];
+        if self.packet_data.len() >= PACKET_HMAC_LEN {
+            hmac.copy_from_slice(&self.packet_data[..PACKET_HMAC_LEN]);
+            let payload = self.packet_data[PACKET_HMAC_LEN..].to_vec();
             (hmac, payload)
         } else {
             hmac.copy_from_slice(&self.packet_data[..]);
@@ -415,8 +458,14 @@ pub enum SphinxError {
     #[error("The parsed data len is too small")]
     PacketDataLenTooSmall,
 
+    #[error("The packet data length does not match the bytes length")]
+    PacketDataLenMismatch,
+
     #[error("Invalid public key")]
     PublicKeyInvalid,
+
+    #[error("Invalid blinding factor")]
+    InvalidBlindingFactor,
 }
 
 /// Keys used to forward the onion packet.
@@ -479,7 +528,9 @@ pub fn derive_ammag_key(shared_secret: &[u8]) -> [u8; 32] {
 /// let hops_path: Vec<_> = hops_keys.iter().map(|sk| sk.public_key(&secp)).collect();
 /// let session_key = SecretKey::from_slice(&[0x41; 32]).expect("32 bytes, within curve order");
 /// // Gets shared secrets for each hop
-/// let hops_ss: Vec<_> = OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp).collect();
+/// let hops_ss: Vec<_> = OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp)
+///     .collect::<Result<Vec<_>, _>>()
+///     .expect("shared secrets");
 /// ```
 #[derive(Clone)]
 pub struct OnionSharedSecretIter<'s, I, C: Signing> {
@@ -507,7 +558,7 @@ impl<'s, I, C: Signing> OnionSharedSecretIter<'s, I, C> {
 impl<'s, 'i, I: Iterator<Item = &'i PublicKey>, C: Signing> Iterator
     for OnionSharedSecretIter<'s, I, C>
 {
-    type Item = [u8; 32];
+    type Item = Result<[u8; 32], SphinxError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.hops_path_iter.next().map(|pk| {
@@ -518,9 +569,9 @@ impl<'s, 'i, I: Iterator<Item = &'i PublicKey>, C: Signing> Iterator
                 self.ephemeral_secret_key,
                 &ephemeral_public_key,
                 shared_secret.as_ref(),
-            );
+            )?;
 
-            shared_secret.secret_bytes()
+            Ok(shared_secret.secret_bytes())
         })
     }
 }
@@ -530,9 +581,9 @@ fn derive_hops_forward_keys<C: Signing>(
     hops_path: &[PublicKey],
     session_key: SecretKey,
     secp_ctx: &Secp256k1<C>,
-) -> Vec<ForwardKeys> {
+) -> Result<Vec<ForwardKeys>, SphinxError> {
     OnionSharedSecretIter::new(hops_path.iter(), session_key, secp_ctx)
-        .map(|shared_secret| ForwardKeys::new(&shared_secret))
+        .map(|shared_secret| shared_secret.map(|shared_secret| ForwardKeys::new(&shared_secret)))
         .collect()
 }
 
@@ -558,7 +609,11 @@ fn shift_slice_left(arr: &mut [u8], amt: usize) {
 }
 
 /// Computes hmac of packet_data and optional associated data using the key `hmac_key`.
-fn compute_hmac(hmac_key: &[u8; 32], packet_data: &[u8], assoc_data: Option<&[u8]>) -> [u8; 32] {
+fn compute_hmac(
+    hmac_key: &[u8; 32],
+    packet_data: &[u8],
+    assoc_data: Option<&[u8]>,
+) -> [u8; PACKET_HMAC_LEN] {
     let mut hmac_engine = Hmac::<Sha256>::new_from_slice(hmac_key).expect("valid hmac key");
     hmac_engine.update(packet_data);
     if let Some(assoc_data) = assoc_data {
@@ -602,44 +657,82 @@ fn forward_stream_cipher<S: StreamCipher>(stream: &mut S, n: usize) {
 /// - `shared_secret`: the shared secret of the current node $s_{i-1}$
 ///
 /// Returns the ephemeral secret key for the mix node $n_i$, which is $x b_0 b_1 \cdots b_{i-1}$.
+///
+/// Returns [`SphinxError::InvalidBlindingFactor`] when the SHA256 output reduced modulo the
+/// secp256k1 curve order is zero. In that case, `mul_tweak` would produce an invalid zero
+/// secret key.
 fn derive_next_hop_ephemeral_secret_key(
     ephemeral_secret_key: SecretKey,
     ephemeral_public_key: &PublicKey,
     shared_secret: &[u8],
-) -> SecretKey {
-    let blinding_factor: [u8; 32] = {
+) -> Result<SecretKey, SphinxError> {
+    let blinding_factor = {
         let mut sha = Sha256::new();
         sha.update(&ephemeral_public_key.serialize()[..]);
         sha.update(shared_secret);
-        sha.finalize().into()
+        scalar_from_blinding_factor(sha.finalize().into())?
     };
 
     ephemeral_secret_key
-        .mul_tweak(&Scalar::from_be_bytes(blinding_factor).expect("valid scalar"))
-        .expect("valid mul tweak")
+        .mul_tweak(&blinding_factor)
+        .map_err(|_| SphinxError::InvalidBlindingFactor)
 }
 
 /// Derives the ephemeral public key for the next hop.
 ///
 /// This is the _alpha_ in the specification.
+///
+/// Returns [`SphinxError::InvalidBlindingFactor`] when the SHA256 output reduced modulo the
+/// secp256k1 curve order is zero. In that case, `mul_tweak` would produce the invalid point at
+/// infinity.
 fn derive_next_hop_ephemeral_public_key<C: Verification>(
     ephemeral_public_key: PublicKey,
     shared_secret: &[u8],
     secp_ctx: &Secp256k1<C>,
-) -> PublicKey {
-    let blinding_factor: [u8; 32] = {
+) -> Result<PublicKey, SphinxError> {
+    let blinding_factor = {
         let mut sha = Sha256::new();
         sha.update(&ephemeral_public_key.serialize()[..]);
         sha.update(shared_secret.as_ref());
-        sha.finalize().into()
+        scalar_from_blinding_factor(sha.finalize().into())?
     };
 
     ephemeral_public_key
-        .mul_tweak(
-            secp_ctx,
-            &Scalar::from_be_bytes(blinding_factor).expect("valid scalar"),
-        )
-        .expect("valid mul tweak")
+        .mul_tweak(secp_ctx, &blinding_factor)
+        .map_err(|_| SphinxError::InvalidBlindingFactor)
+}
+
+fn scalar_from_blinding_factor(mut blinding_factor: [u8; 32]) -> Result<Scalar, SphinxError> {
+    if blinding_factor >= constants::CURVE_ORDER {
+        subtract_secp256k1_order(&mut blinding_factor);
+    }
+
+    if blinding_factor == constants::ZERO {
+        return Err(SphinxError::InvalidBlindingFactor);
+    }
+
+    Scalar::from_be_bytes(blinding_factor).map_err(|_| SphinxError::InvalidBlindingFactor)
+}
+
+// The secp256k1 crate exposes the curve order but not a modulo-reducing Scalar
+// constructor. A SHA256 output is less than 2^256, so one subtraction is enough.
+// A big-integer dependency would add audit surface for this fixed-size operation
+// without simplifying it.
+fn subtract_secp256k1_order(value: &mut [u8; 32]) {
+    let mut borrow = 0u16;
+
+    for (byte, order_byte) in value.iter_mut().zip(constants::CURVE_ORDER.iter()).rev() {
+        let subtrahend = *order_byte as u16 + borrow;
+        let minuend = *byte as u16;
+
+        if minuend >= subtrahend {
+            *byte = (minuend - subtrahend) as u8;
+            borrow = 0;
+        } else {
+            *byte = (minuend + 256 - subtrahend) as u8;
+            borrow = 1;
+        }
+    }
 }
 
 /// Derives a key from the shared secret using HMAC.
@@ -672,8 +765,7 @@ fn generate_filler(
         let mut chacha = ChaCha20::new(&keys.rho.into(), &[0u8; 12].into());
         forward_stream_cipher(&mut chacha, packet_data_len - pos);
 
-        // 32 for mac
-        pos += data.len() + 32;
+        pos += data.len() + PACKET_HMAC_LEN;
         if pos > packet_data_len {
             return Err(SphinxError::HopDataLenTooLarge);
         }
@@ -706,13 +798,13 @@ fn construct_onion_packet(
     assoc_data: Option<Vec<u8>>,
     filler: Vec<u8>,
 ) -> Result<OnionPacket, SphinxError> {
-    let mut hmac = [0; 32];
+    let mut hmac = [0; PACKET_HMAC_LEN];
 
     for (i, (data, keys)) in hops_data.iter().zip(hops_keys.iter()).rev().enumerate() {
         let data_len = data.len();
-        shift_slice_right(&mut packet_data, data_len + 32);
+        shift_slice_right(&mut packet_data, data_len + PACKET_HMAC_LEN);
         packet_data[0..data_len].copy_from_slice(data);
-        packet_data[data_len..(data_len + 32)].copy_from_slice(&hmac);
+        packet_data[data_len..(data_len + PACKET_HMAC_LEN)].copy_from_slice(&hmac);
 
         let mut chacha = ChaCha20::new(&keys.rho.into(), &[0u8; 12].into());
         chacha.apply_keystream(&mut packet_data);

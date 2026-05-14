@@ -44,6 +44,7 @@ fn test_onion_packet_from_bytes() {
         packet_data: vec![2],
         hmac: [3; 32],
     };
+    #[allow(deprecated)]
     let packet_from_bytes_res = OnionPacket::from_bytes(packet.clone().into_bytes());
     assert!(packet_from_bytes_res.is_ok());
     let packet_from_bytes = packet_from_bytes_res.unwrap();
@@ -51,10 +52,56 @@ fn test_onion_packet_from_bytes() {
 }
 
 #[test]
+fn test_onion_packet_from_bytes_with_packet_data_len() {
+    let public_key = PublicKey::from_slice(
+        Vec::from_hex("02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619")
+            .expect("valid hex")
+            .as_ref(),
+    )
+    .expect("valid public key");
+    let packet = OnionPacket {
+        version: 1,
+        public_key,
+        packet_data: vec![2, 4],
+        hmac: [3; 32],
+    };
+
+    let packet_from_bytes_res =
+        OnionPacket::from_bytes_with_packet_data_len(packet.clone().into_bytes(), 2);
+    assert!(packet_from_bytes_res.is_ok());
+    let packet_from_bytes = packet_from_bytes_res.unwrap();
+    assert_eq!(packet_from_bytes, packet);
+}
+
+#[test]
+fn test_onion_packet_from_bytes_with_packet_data_len_mismatch() {
+    let public_key = PublicKey::from_slice(
+        Vec::from_hex("02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619")
+            .expect("valid hex")
+            .as_ref(),
+    )
+    .expect("valid public key");
+    let packet = OnionPacket {
+        version: 1,
+        public_key,
+        packet_data: vec![2, 4],
+        hmac: [3; 32],
+    };
+
+    let packet_from_bytes_res =
+        OnionPacket::from_bytes_with_packet_data_len(packet.into_bytes(), 1);
+    assert_eq!(
+        packet_from_bytes_res,
+        Err(SphinxError::PacketDataLenMismatch)
+    );
+}
+
+#[test]
 fn test_derive_hops_keys() {
     let hops_path = get_test_hops_path();
     let session_key = get_test_session_key();
-    let hops_keys = derive_hops_forward_keys(&hops_path, session_key, &Secp256k1::new());
+    let hops_keys =
+        derive_hops_forward_keys(&hops_path, session_key, &Secp256k1::new()).expect("hops keys");
 
     assert_eq!(hops_keys.len(), 5);
 
@@ -110,6 +157,47 @@ fn test_derive_hops_keys() {
 }
 
 #[test]
+fn test_scalar_from_blinding_factor_rejects_zero() {
+    let scalar = scalar_from_blinding_factor(constants::ZERO);
+
+    assert_eq!(scalar, Err(SphinxError::InvalidBlindingFactor));
+}
+
+#[test]
+fn test_scalar_from_blinding_factor_reduces_mod_order() {
+    let mut blinding_factor = constants::CURVE_ORDER;
+    blinding_factor[31] += 1;
+
+    let scalar = scalar_from_blinding_factor(blinding_factor).expect("valid reduced scalar");
+
+    assert_eq!(scalar, Scalar::ONE);
+}
+
+#[test]
+fn test_scalar_from_blinding_factor_accepts_one() {
+    let scalar = scalar_from_blinding_factor(constants::ONE).expect("valid scalar");
+
+    assert_eq!(scalar, Scalar::ONE);
+}
+
+#[test]
+fn test_scalar_from_blinding_factor_accepts_order_minus_one() {
+    let mut blinding_factor = constants::CURVE_ORDER;
+    blinding_factor[31] -= 1;
+
+    let scalar = scalar_from_blinding_factor(blinding_factor).expect("valid scalar");
+
+    assert_eq!(scalar, Scalar::MAX);
+}
+
+#[test]
+fn test_scalar_from_blinding_factor_rejects_order() {
+    let scalar = scalar_from_blinding_factor(constants::CURVE_ORDER);
+
+    assert_eq!(scalar, Err(SphinxError::InvalidBlindingFactor));
+}
+
+#[test]
 fn test_derive_pad_key() {
     let session_key = get_test_session_key();
     let pad_key = derive_key(b"pad", &session_key.secret_bytes());
@@ -133,7 +221,8 @@ fn test_generate_padding_data() {
 fn test_generate_filler() {
     let hops_path = get_test_hops_path();
     let session_key = get_test_session_key();
-    let hops_keys = derive_hops_forward_keys(&hops_path, session_key, &Secp256k1::new());
+    let hops_keys =
+        derive_hops_forward_keys(&hops_path, session_key, &Secp256k1::new()).expect("hops keys");
     let hops_data = get_test_hops_data();
 
     let filler = generate_filler(PACKET_DATA_LEN, &hops_keys, &hops_data);
@@ -279,8 +368,9 @@ fn test_create_onion_error_packet() {
     let secp = Secp256k1::new();
     let hops_path = get_test_hops_path();
     let session_key = get_test_session_key();
-    let hops_ss: Vec<_> =
-        OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp).collect();
+    let hops_ss: Vec<_> = OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("shared secrets");
     let error_payload = <Vec<u8>>::from_hex("0002200200fe0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000").expect("valid hex");
 
     let onion_packet_1 = OnionErrorPacket::create(&hops_ss[4], error_payload);
@@ -369,8 +459,9 @@ fn test_parse_onion_error_packet() {
     let secp = Secp256k1::new();
     let hops_path = get_test_hops_path();
     let session_key = get_test_session_key();
-    let hops_ss: Vec<_> =
-        OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp).collect();
+    let hops_ss: Vec<_> = OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("shared secrets");
     let error_payload = <Vec<u8>>::from_hex("0002200200fe0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000").expect("valid hex");
 
     {
@@ -415,6 +506,24 @@ fn test_parse_onion_error_packet() {
         );
         assert!(error.is_none());
     }
+}
+
+#[test]
+fn test_parse_onion_error_packet_checks_hmac_before_payload() {
+    let secp = Secp256k1::new();
+    let hops_path = get_test_hops_path();
+    let session_key = get_test_session_key();
+    let hops_ss: Vec<_> = OnionSharedSecretIter::new(hops_path.iter(), session_key, &secp)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("shared secrets");
+    let error_payload = <Vec<u8>>::from_hex("0002200200fe0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000").expect("valid hex");
+
+    let packet = OnionErrorPacket::create(&hops_ss[1], error_payload);
+    let error: Option<(Vec<u8>, usize)> = packet.parse(hops_path, session_key, |_| {
+        panic!("payload parser should not be called when hmac does not match")
+    });
+
+    assert!(error.is_none());
 }
 
 #[test]
